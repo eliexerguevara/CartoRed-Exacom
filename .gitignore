@@ -11,3 +11,4 @@ enlaces.json
 *.bak*
 *.tmp
 __pycache__/
+cartored-instalar.sh

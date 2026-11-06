@@ -7,9 +7,20 @@ import copy
 import json
 import re
 import sys
+import types
 from pathlib import Path
 
-from sc2.ui.widgets.platform_icons import get_platform_icon_manager
+import sc2
+
+# El gestor de iconos no usa PyQt, pero los __init__ de sc2.ui y sc2.ui.widgets cargan toda la interfaz grafica
+# (PyQt6 + QtWebEngine). Se registran esos dos paquetes vacios para importar solo platform_icons.
+_UI = Path(sc2.__file__).parent / 'ui'
+for _nombre, _ruta in (('sc2.ui', _UI), ('sc2.ui.widgets', _UI / 'widgets')):
+    if _nombre not in sys.modules:
+        _m = types.ModuleType(_nombre)
+        _m.__path__ = [str(_ruta)]
+        sys.modules[_nombre] = _m
+from sc2.ui.widgets.platform_icons import get_platform_icon_manager  # noqa: E402
 
 DESTINO = Path('/var/www/html/mapa/data')
 
