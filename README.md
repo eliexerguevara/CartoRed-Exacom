@@ -139,6 +139,8 @@ sigue con SNMP.
 
 ## Opcional: proxys para redes remotas
 
+Guía paso a paso para MikroTik (servidor con IP pública y proxy detrás de NAT): [instalacion-Cartored-RouterOS.md](instalacion-Cartored-RouterOS.md).
+
 ```
 proxy (red remota) ── POST proxy.php?accion=trabajo  (cada 30 s, firmado) ──> servidor
                    <── trabajo.bin: mapas a recorrer + comunidades (cifrado con el token)
