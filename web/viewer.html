@@ -2156,7 +2156,7 @@ function decorar(cy) {
 }
 
 // Niveles: externos arriba, router, distribucion, acceso en una fila (orden numerico), sin IP abajo
-function layoutOrdenado(cy) {
+function layoutOrdenado(cy, animar = true) {
     const visibles = cy.nodes(':visible');
     const clave = n => n.data('label').replace(/^⚠\s*/, '');
     const orden = (a, b) => clave(a).localeCompare(clave(b), 'es', { numeric: true });
@@ -2186,8 +2186,10 @@ function layoutOrdenado(cy) {
     }
     if (sinIp.length) fila(sinIp, y + 20, 150);
     const final = conGuardadas(pos);
+    cy.stop(true, true);
+    cy.nodes().stop(true, true);     // corta una animacion anterior que siga en curso
     cy.layout({ name: 'preset', positions: n => final[n.id()] || { x: 0, y: 0 }, fit: true, padding: 40,
-                animate: true, animationDuration: 350 }).run();
+                animate: animar && !document.hidden, animationDuration: 350 }).run();
 }
 
 // ===== Orden guardado (boton Guardar), seleccion por recuadro y mover varios =====
@@ -2766,7 +2768,7 @@ function agregarSolapaConfig(data) {
             .selector('node.h-nuevo').style({ 'border-color': '#22c55e', 'border-width': 7, 'border-style': 'double' })
             .selector('edge.h-nuevo').style({ 'line-color': '#22c55e', 'width': 3.5, 'opacity': 1, 'line-style': 'solid' })
             .update();
-        layoutOrdenado(this.cy);
+        layoutOrdenado(this.cy, !this._sinAnimar);
         llenarVlans();
         this.cy.style().selector('.tipo-oculto').style({ 'display': 'none' }).update();
         aplicarTipos();
@@ -2822,10 +2824,25 @@ function cargarConservando(data) {
     const cy = TopologyViewer.cy;
     if (!cy || !cy.nodes().length) { TopologyViewer.loadTopology(data); return; }
     const vista = { zoom: cy.zoom(), pan: { ...cy.pan() } }, pos = {};
-    cy.nodes().forEach(n => { pos[n.id()] = { ...n.position() }; });
-    TopologyViewer.loadTopology(data);
+    // si ya estaban apilados (recarga anterior fallida), no se conservan esas posiciones
+    if (!estanApilados(cy)) cy.nodes().forEach(n => { pos[n.id()] = { ...n.position() }; });
+    TopologyViewer._sinAnimar = true;
+    try { TopologyViewer.loadTopology(data); } finally { TopologyViewer._sinAnimar = false; }
+    cy.nodes().stop(true, true);
     cy.batch(() => cy.nodes().forEach(n => { if (pos[n.id()]) n.position(pos[n.id()]); }));
-    cy.viewport(vista);
+    if (Object.keys(pos).length) cy.viewport(vista);
+    arreglarApilados();
+}
+// Todos los equipos visibles en el mismo punto: la vista quedo rota (p. ej. una animacion frenada por el navegador)
+function estanApilados(cy) {
+    const vs = cy.nodes(':visible');
+    if (vs.length < 3) return false;
+    const p0 = vs[0].position();
+    return vs.every(n => Math.abs(n.position().x - p0.x) < 2 && Math.abs(n.position().y - p0.y) < 2);
+}
+function arreglarApilados() {
+    const cy = TopologyViewer.cy;
+    if (cy && estanApilados(cy)) layoutOrdenado(cy, false);
 }
 function cargarDatos(conservar) {
     return cargarPosiciones().then(() => fetch(BASE_URL + 'datos.php?map=' + encodeURIComponent(nombreMapa), { cache: 'no-store', credentials: 'same-origin' })
@@ -2854,7 +2871,7 @@ async function vigilarActualizaciones() {
     } catch (err) { /* sin conexion: se reintenta */ }
 }
 setInterval(vigilarActualizaciones, 30000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) vigilarActualizaciones(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { arreglarApilados(); vigilarActualizaciones(); } });
 
 // ---- Historial (7 dias): una foto del mapa por cada actualizacion ----
 const hist = { abierto: false, items: [], idx: 0, cache: new Map(), play: null, pedido: 0 };
