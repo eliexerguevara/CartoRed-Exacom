@@ -64,16 +64,21 @@ main() {
     /opt/seccart2/bin/pip install -q --upgrade pip
     # sin la interfaz grafica (PyQt6, ~600 MB): el servidor solo usa el recorrido SNMP, el almacen y los iconos
     /opt/seccart2/bin/pip install -q --no-deps "seccart2==$VERSION_SC2"
-    /opt/seccart2/bin/pip install -q pysnmp==7.1.30 pyasn1==0.6.5 cryptography paramiko==3.5.1 textfsm==2.1.0 \
-        PyYAML==6.0.3 aiofiles==25.1.0
+    # pip avisa que falta PyQt6: es a proposito, se oculta ese aviso
+    if ! /opt/seccart2/bin/pip install -q pysnmp==7.1.30 pyasn1==0.6.5 cryptography paramiko==3.5.1 textfsm==2.1.0 \
+            PyYAML==6.0.3 aiofiles==25.1.0 requests 2>/tmp/cartored-pip.err; then
+        cat /tmp/cartored-pip.err; falla "No se pudieron instalar las librerías de Python."
+    fi
+    grep -v "PyQt6\|dependency resolver\|which is not installed" /tmp/cartored-pip.err || true
+    rm -f /tmp/cartored-pip.err
     if [ -e /opt/seccart2/bin/seccart2-creds ]; then ln -sf /opt/seccart2/bin/seccart2-creds /usr/local/bin/seccart2-creds; fi
     /opt/seccart2/bin/python -c 'import sc2.scng.discovery.cli, sc2.scng.creds.vault' \
         || falla "SecureCartography2 quedó instalado pero no carga (ver el error de arriba)."
 
     paso "Programa CartoRed"
-    local tmp
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    TMP_INST=$(mktemp -d)
+    trap 'rm -rf "${TMP_INST:-}"' EXIT
+    local tmp=$TMP_INST
     extraer "$tmp"
     install -m 755 "$tmp"/bin/seccart2-anexar "$tmp"/bin/seccart2-publicar /usr/local/bin/
     install -m 700 "$tmp"/bin/seccart2-crawl /usr/local/bin/
