@@ -1,0 +1,78 @@
+/* Estilo comun: Mapas, Nuevo mapa, Hosts, Comunidades, Usuarios e Ingreso */
+:root {
+  --fondo: #0f1115; --barra: #12151b; --panel: #171a21; --panel2: #12151b; --borde: #262b36; --borde2: #2f3542;
+  --txt: #e6e8ec; --sub: #9aa3b2; --sub2: #c7ccd6; --link: #60a5fa; --acento: #2563eb; --acento-bg: #13203d; --acento-borde: #3b82f6;
+  --ok: #22c55e; --ok-txt: #4ade80; --err: #f87171; --err-txt: #fca5a5; --warn: #f59e0b; --warn-txt: #fbbf24;
+  --router: #2563eb; --switch: #0d9488; --acceso: #475569; --antena: #c2410c; --servidor: #7e22ce;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--fondo); color: var(--txt); font: 14px/1.5 'IBM Plex Sans', system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--link); text-decoration: none; } a:hover { color: #93c5fd; }
+.mono { font-family: 'IBM Plex Mono', ui-monospace, Consolas, monospace; font-size: 13px; }
+.sub { color: var(--sub); }
+.oculto-lect { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Menu superior */
+.barra { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 24px; padding: 0 24px; min-height: 60px;
+         background: var(--barra); border-bottom: 1px solid #232833; }
+.marca { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: var(--txt); }
+.marca:hover { color: var(--txt); }
+.logo { width: 30px; height: 30px; border-radius: 8px; background: var(--acento); display: flex; align-items: center; justify-content: center; }
+.menu { display: flex; gap: 4px; flex-wrap: wrap; }
+.menu a { padding: 10px 14px; border-radius: 6px; color: var(--sub); font-size: 14px; }
+.menu a:hover { color: var(--txt); background: #1a1f29; }
+.menu a[aria-current="page"] { background: #1e2532; color: var(--txt); font-weight: 500; }
+.cuenta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--sub); font-size: 14px; }
+.cuenta form { margin: 0; }
+.avatar { width: 32px; height: 32px; border-radius: 50%; background: #334155; color: var(--txt); display: flex; align-items: center;
+          justify-content: center; font-size: 12px; font-weight: 600; }
+
+/* Botones y campos */
+.btn, button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 14px;
+               border-radius: 8px; border: 1px solid var(--borde2); background: transparent; color: var(--txt);
+               font: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; }
+.btn:hover, button:hover { border-color: #4b5466; color: var(--txt); }
+button:disabled { opacity: .45; cursor: default; }
+.btn.prim, button.prim { background: var(--acento); border-color: var(--acento); color: #fff; font-weight: 600; }
+.btn.prim:hover, button.prim:hover { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+button.peligro, .btn.peligro { color: var(--err-txt); border-color: #5b1d1d; }
+button.link { min-height: 0; padding: 6px; border: 0; color: var(--link); }
+button.icono { width: 40px; padding: 0; }
+input, select, textarea { min-height: 40px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--borde2); background: var(--panel2);
+                          color: var(--txt); font: inherit; font-size: 14px; }
+input[type=checkbox], input[type=radio] { min-height: 0; width: 18px; height: 18px; padding: 0; accent-color: var(--acento); }
+input:focus, select:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--acento-borde); outline-offset: 1px; }
+label.campo { display: flex; flex-direction: column; gap: 6px; font-size: 14px; font-weight: 500; }
+
+/* Contenido */
+.pagina { max-width: 1320px; margin: 0 auto; padding: 28px 24px 56px; display: flex; flex-direction: column; gap: 20px; }
+.titulo { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; }
+.titulo h1 { margin: 0; font-size: 26px; font-weight: 600; }
+.titulo .acciones { margin-left: auto; }
+.acciones { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tarjeta { border-radius: 12px; border: 1px solid var(--borde); background: var(--panel); }
+.tarjeta > .cab { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 14px 18px; border-bottom: 1px solid var(--borde); }
+.tarjeta > .cab h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.tarjeta > .cuerpo { padding: 16px 18px; }
+.msg { padding: 12px 14px; border-radius: 8px; font-size: 14px; }
+.msg.ok { background: #0f2a1a; border: 1px solid #14532d; color: #bbf7d0; }
+.msg.err { background: #2a1215; border: 1px solid #7f1d1d; color: var(--err-txt); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+.pill .p { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ok { background: #0f2a1a; color: var(--ok-txt); } .pill.run { background: var(--acento-bg); color: #93c5fd; }
+.pill.warn { background: #2a2414; color: var(--warn-txt); } .pill.err { background: #2a1215; color: var(--err-txt); }
+.pill.gris { background: #232a36; color: var(--sub2); }
+.chip { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 99px; background: #232a36; color: var(--sub2);
+        font-size: 12px; margin: 1px 4px 1px 0; white-space: nowrap; }
+.chip.act { background: var(--acento-bg); color: #bfdbfe; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--sub); font-weight: 500; font-size: 13px; padding: 11px 10px; border-bottom: 1px solid var(--borde); white-space: nowrap; }
+td { padding: 9px 10px; border-bottom: 1px solid #20242d; vertical-align: middle; }
+tbody tr:last-child td { border-bottom: 0; }
+.tabla-wrap { overflow-x: auto; }
+.vacio { padding: 22px 18px; color: var(--sub); }
+.casilla { display: flex; gap: 12px; align-items: flex-start; cursor: pointer; }
+.casilla input { margin-top: 3px; flex: none; }
+.casilla b { display: block; font-weight: 500; font-size: 15px; color: var(--txt); }
+.casilla span span { font-size: 13px; color: var(--sub); line-height: 1.45; }
+@media (max-width: 640px) { .barra, .pagina { padding-left: 16px; padding-right: 16px; } .cuenta span:not(.avatar) { display: none; } }

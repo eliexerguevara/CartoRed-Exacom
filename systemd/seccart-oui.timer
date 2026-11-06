@@ -1,0 +1,10 @@
+[Unit]
+Description=Actualizacion mensual de la lista de fabricantes por MAC
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

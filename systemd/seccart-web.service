@@ -1,0 +1,7 @@
+[Unit]
+Description=Procesa solicitudes de la web de mapas (SecureCartography2)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/seccart-web-run
+TimeoutStartSec=2h

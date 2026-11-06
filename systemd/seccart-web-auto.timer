@@ -1,0 +1,9 @@
+[Unit]
+Description=Actualizacion automatica de los mapas web, cada minuto se revisa que mapa toca
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

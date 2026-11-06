@@ -1,0 +1,8 @@
+#!/opt/seccart2/bin/python
+# seccart2-discover sin pedir la clave del almacen: la lee de /root/.seccart2/vault.pass
+import getpass, sys
+_pw = open("/root/.seccart2/vault.pass").read().strip()
+getpass.getpass = lambda prompt="": _pw
+from sc2.scng.discovery.cli import main
+sys.argv[0] = "seccart2-crawl"
+sys.exit(main())

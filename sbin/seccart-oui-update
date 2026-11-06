@@ -1,0 +1,12 @@
+#!/bin/sh
+# Actualiza la lista de fabricantes por MAC (Wireshark manuf) que usa seccart2-publicar
+D=/var/lib/seccart-oui
+mkdir -p $D
+if curl -sSfL -m 120 -o $D/manuf.new https://www.wireshark.org/download/automated/data/manuf && [ $(wc -l < $D/manuf.new) -gt 10000 ]; then
+    mv $D/manuf.new $D/manuf
+    echo "lista de fabricantes actualizada ($(wc -l < $D/manuf) lineas)"
+else
+    rm -f $D/manuf.new
+    echo "no se pudo actualizar la lista de fabricantes" >&2
+    exit 1
+fi

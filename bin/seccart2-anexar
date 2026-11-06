@@ -1,0 +1,1474 @@
+#!/opt/seccart2/bin/python
+"""Anexa a un map.json equipos de una lista (nombre, IP), aunque no tengan SNMP, y (opcional)
+agrega automaticamente los vecinos LLDP/CDP que no estan en la lista.
+
+- MAC <-> IP: tabla ARP completa de los equipos tipo router (--router, se puede repetir).
+- Ubicacion: busca la MAC en las tablas de MAC (Q-BRIDGE) de switches y routers; el puerto de acceso
+  es donde la MAC aparece con menos MACs aprendidas. LLDP aporta tambien los enlaces bloqueados por RSTP.
+- Modelo: sysDescr por SNMP si el equipo responde con alguna comunidad de la lista.
+- Reemplaza nodos del mapa con la misma IP (p.ej. varios equipos llamados "SWITCH").
+- --auto-vecinos: cada vecino LLDP/CDP de router o switches que no este en la lista ni en el mapa se agrega
+  con su MAC (chassis LLDP) y la IP que le corresponde en el ARP (o la IP de gestion que anuncia).
+
+Uso:
+  seccart2-anexar <map.json> <lista.csv> --router IP [--router IP ...] [--switch IP ...]
+                  --community C [--community C ...] [--auto-vecinos] [-o salida.json]
+lista.csv: una linea por equipo "nombre,ip" (separado por coma, tab o espacios). Puede estar vacia.
+"""
+import argparse
+import ipaddress
+import json
+import re
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+GENERICOS = {"", "?", "switch", "router", "mikrotik", "default", "localhost"}
+
+# Interfaz SNMP de cada host configurado: ip -> {"version": "v1"|"v2c", "puerto": int, "tipo": ...}
+CFG_HOST = {}
+# Equipos que no se dibujan en este mapa (pagina Hosts): por IP o por MAC
+OCULTAR = {"ips": set(), "macs": set(), "ppp": True}
+SIN_ESCANEO = set()   # hosts "solo dibujar": no se les manda SNMP ni ping
+API_ROS = {}          # usuario API de RouterOS (solo lectura) para leer las VLANs del bridge
+
+
+def api_ros(ip, usuario, clave, comandos, timeout=8):
+    """API de RouterOS (8728; si no, 8729 con TLS). Devuelve una lista de filas (dict) por comando."""
+    import socket
+    import ssl
+
+    def largo(n):
+        if n < 0x80:
+            return bytes([n])
+        if n < 0x4000:
+            return (n | 0x8000).to_bytes(2, "big")
+        if n < 0x200000:
+            return (n | 0xC00000).to_bytes(3, "big")
+        if n < 0x10000000:
+            return (n | 0xE0000000).to_bytes(4, "big")
+        return b"\xf0" + n.to_bytes(4, "big")
+
+    def enviar(s, palabras):
+        s.sendall(b"".join(largo(len(w.encode())) + w.encode() for w in palabras) + b"\x00")
+
+    def exacto(s, n):
+        b = b""
+        while len(b) < n:
+            c = s.recv(n - len(b))
+            if not c:
+                raise OSError("conexion cerrada")
+            b += c
+        return b
+
+    def leer_largo(s):
+        b = exacto(s, 1)[0]
+        if b < 0x80:
+            return b
+        if b < 0xC0:
+            return ((b & 0x3F) << 8) | exacto(s, 1)[0]
+        if b < 0xE0:
+            return ((b & 0x1F) << 16) | int.from_bytes(exacto(s, 2), "big")
+        if b < 0xF0:
+            return ((b & 0x0F) << 24) | int.from_bytes(exacto(s, 3), "big")
+        return int.from_bytes(exacto(s, 4), "big")
+
+    def respuesta(s):
+        filas = []
+        while True:
+            frase = []
+            while True:
+                n = leer_largo(s)
+                if not n:
+                    break
+                frase.append(exacto(s, n).decode("utf-8", "replace"))
+            if not frase:
+                continue
+            attrs = {}
+            for w in frase[1:]:
+                if w.startswith("="):
+                    k, _, v = w[1:].partition("=")
+                    attrs[k] = v
+            if frase[0] == "!re":
+                filas.append(attrs)
+            elif frase[0] == "!done":
+                return filas
+            elif frase[0] in ("!trap", "!fatal"):
+                raise RuntimeError(attrs.get("message") or frase[0])
+
+    ultimo = None
+    for puerto, tls in ((8728, False), (8729, True)):
+        try:
+            s = socket.create_connection((ip, puerto), timeout=timeout)
+            if tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+                s = ctx.wrap_socket(s)
+            s.settimeout(timeout)
+            try:
+                enviar(s, ["/login", "=name=" + usuario, "=password=" + clave])
+                respuesta(s)
+                res = []
+                for c in comandos:
+                    enviar(s, c)
+                    res.append(respuesta(s))
+                return res
+            finally:
+                s.close()
+        except RuntimeError:        # el equipo respondio con un error (p. ej. usuario o clave): no se reintenta
+            raise
+        except Exception as e:      # no se pudo conectar: se prueba el otro puerto; si los dos fallan, se informa
+            ultimo = e
+    raise RuntimeError(str(ultimo))
+# Enlaces dibujados a mano (equipos sin SNMP): [{"a": ip, "pa": puerto, "b": ip, "pb": puerto}]
+MANUALES = []
+
+
+def destino(host):
+    """Version y destino para net-snmp segun la configuracion del host (por defecto v2c, puerto 161)."""
+    cfg = CFG_HOST.get(host, {})
+    version = "-v1" if cfg.get("version") == "v1" else "-v2c"
+    puerto = cfg.get("puerto") or 161
+    return version, (host if puerto == 161 else f"udp:{host}:{puerto}")
+
+
+# Respuestas de walk ya leidas (se piden todas en paralelo al principio) y equipos sin SNMP
+_WALKS, _WALKS_LOCK, MUERTOS = {}, threading.Lock(), set()
+
+
+def walk(host, community, oid, timeout=8):
+    clave = (host, community, oid)
+    with _WALKS_LOCK:
+        if clave in _WALKS:
+            return _WALKS[clave]
+    if host in MUERTOS:
+        return {}
+    version, dst = destino(host)
+    # v2c: GETBULK (decenas de filas por pedido); v1 no lo tiene
+    cmd = (["snmpbulkwalk", "-Cr40"] if version == "-v2c" else ["snmpwalk"]) + \
+          [version, "-c", community, "-t", str(timeout), "-r", "1", "-On", "-Oe", dst, oid]
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    res = {}
+    for line in out.splitlines():
+        m = re.match(r"(\S+) = (?:[\w-]+: )?(.*)$", line)
+        if m and m.group(1).startswith(oid + "."):
+            res[m.group(1)[len(oid) + 1:]] = m.group(2).strip().strip('"')
+    with _WALKS_LOCK:
+        _WALKS[clave] = res
+    return res
+
+
+def en_paralelo(fn, items, hilos=32):
+    items = list(items)
+    if not items:
+        return []
+    with ThreadPoolExecutor(min(hilos, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
+def snmp_get(host, community, oids, timeout=2):
+    version, dst = destino(host)
+    r = subprocess.run(["snmpget", version, "-c", community, "-t", str(timeout), "-r", "1", "-Oqv", dst, *oids],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or "Timeout" in r.stdout + r.stderr:
+        return None
+    return [x.strip().strip('"') for x in r.stdout.splitlines()]
+
+
+def leer_lista(path):
+    equipos = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        partes = [p for p in re.split(r"[,\t ]+", line) if p]
+        # formato: nombre ip  |  nombre ip credencial (la credencial es opcional)
+        cred = ""
+        if len(partes) >= 3 and not re.match(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$", partes[-1]) \
+                and re.match(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$", partes[-2]):
+            cred = partes.pop()
+        if len(partes) >= 2:
+            ip = partes[-1].split(":")[0]
+            equipos.append((" ".join(partes[:-1]), ip, cred))
+    return equipos
+
+
+def mac_txt(n):
+    return ":".join(f"{(n >> s) & 255:02x}" for s in range(40, -8, -8))
+
+
+def mac_int(txt):
+    h = re.sub(r"[^0-9a-fA-F]", "", txt or "")
+    return int(h, 16) if len(h) == 12 else None
+
+
+def redes_conectadas(host, community):
+    """Redes privadas conectadas al router (ipAddrTable), de /22 a /30."""
+    redes = set()
+    for ip, mask in walk(host, community, ".1.3.6.1.2.1.4.20.1.3").items():
+        try:
+            red = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+        except ValueError:
+            continue
+        if red.is_private and 22 <= red.prefixlen <= 30 and not red.is_loopback:
+            redes.add(red)
+    return sorted(redes)
+
+
+def barrido_ping(redes):
+    """Un ping a cada IP de las redes: obliga al router a resolver (y guardar en el ARP) los equipos activos."""
+    def uno(red):
+        net = ipaddress.ip_network(red, strict=False)
+        excluir = {ip for ip in SIN_ESCANEO if ipaddress.ip_address(ip) in net}
+        if excluir:   # sin los hosts "solo dibujar": la lista de IPs va por stdin
+            lista = "\n".join(str(x) for x in net.hosts() if str(x) not in excluir)
+            r = subprocess.run(["fping", "-q", "-a", "-r", "0", "-t", "300", "-i", "2"], input=lista,
+                               capture_output=True, text=True, timeout=600)
+        else:
+            r = subprocess.run(["fping", "-q", "-a", "-r", "0", "-t", "300", "-i", "2", "-g", str(red)],
+                               capture_output=True, text=True, timeout=600)
+        n = len([l for l in r.stdout.splitlines() if l.strip()])
+        print(f"Barrido {red}: {n} responden")
+        return n
+    return sum(en_paralelo(uno, redes, 12))
+
+
+def es_logica(puerto):
+    """Interfaz logica (vlan, bridge...) en vez de puerto fisico."""
+    return bool(re.match(r"(vlan|bridge|br-|bond|eoip|l2tp|pppoe|<)", puerto or "", re.I))
+
+
+# ---- Enlaces fisicos (cable directo) e indirectos (por VLAN, tunel o a traves de otro switch) ----
+MAC = re.compile(r"^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$|^([0-9a-fA-F]{2} ){5}[0-9a-fA-F]{2}$|^([0-9a-fA-F]{2}:){6,}")
+VLAN = re.compile(r"^(vlan|vl)\s*\d", re.I)
+TUNEL = re.compile(r"^<?(eoip|l2tp|pppoe|gre|ipip|ovpn|sstp|wg|wireguard|pptp|6to4|vpls)", re.I)
+SIN_PUERTO = re.compile(r"^(uplink|manual|bridge\d*|br[-_]?\w*|lan|wan|bond\d*|)$", re.I)
+
+
+def miembro(p):
+    """'BR-Local/ether8' -> 'ether8' (puerto dentro de un bridge); 'GigabitEthernet1/0/9' queda igual."""
+    p = re.sub(r"\s*\(respaldo RSTP\)$", "", (p or "").strip())
+    return p if re.search(r"\d/\d", p) or "/" not in p else p.rsplit("/", 1)[1]
+
+
+def puerto_fisico(p):
+    """Nombre del puerto fisico normalizado, o None si no se sabe (MAC, 'uplink', bridge sin miembro...)."""
+    p = miembro(p)
+    if not p or MAC.match(p) or SIN_PUERTO.match(p) or VLAN.match(p) or TUNEL.match(p):
+        return None
+    return re.sub(r"\s+", "", p).lower()
+
+
+def tipo_conexion(la, lb):
+    """'vlan' si alguno de los dos extremos es una interfaz VLAN, 'tunel' si es un tunel, si no 'eth'."""
+    if any(VLAN.match(miembro(p)) or VLAN.match((p or "").strip()) for p in (la, lb)):
+        return "vlan"
+    if any(TUNEL.match(miembro(p)) or TUNEL.match((p or "").strip()) for p in (la, lb)):
+        return "tunel"
+    return "eth"
+
+
+def separar_indirectos(mapa, nucleo):
+    """Devuelve {(a, b): motivo} con los pares (ordenados) que NO son cable directo. No modifica el mapa.
+    nucleo: nodos con tabla de vecinos propia (routers/switches recorridos)."""
+    # avistamientos fisicos: (A, puertoA, B, puertoB); cada conexion se ve desde los dos lados
+    pares = {}
+    for a, d in mapa.items():
+        for b, p in d.get("peers", {}).items():
+            if p.get("manual") or b not in mapa or b == a:
+                continue
+            k = tuple(sorted((a, b)))
+            for cn in p.get("connections", []):
+                if not cn or len(cn) < 2:
+                    continue
+                pares.setdefault(k, []).append((a, cn[0], b, cn[1]))
+    tipos, avist = {}, []
+    for k, cs in pares.items():
+        ts = {tipo_conexion(la, lb) for _, la, _, lb in cs}
+        tipos[k] = "eth" if "eth" in ts else ("tunel" if "tunel" in ts else "vlan")
+        if tipos[k] == "eth":
+            for a, la, b, lb in cs:
+                if tipo_conexion(la, lb) == "eth":
+                    avist.append((a, puerto_fisico(la), b, puerto_fisico(lb)))
+    # ocupacion de cada puerto fisico: vecinos vistos en el
+    occ = {}
+    for a, pa, b, pb in avist:
+        if pa:
+            occ.setdefault((a, pa), set()).add(b)
+        if pb:
+            occ.setdefault((b, pb), set()).add(a)
+    # 1) directo seguro: en uno de los dos extremos el puerto tiene un solo vecino
+    seguro = set()
+    extremo = {}          # (equipo, puerto) -> par directo que ocupa ese puerto
+    for a, pa, b, pb in avist:
+        if (pa and occ[(a, pa)] == {b}) or (pb and occ[(b, pb)] == {a}):
+            seguro.add(tuple(sorted((a, b))))
+    # un par confirmado ocupa los puertos de los dos lados (en todos sus avistamientos)
+    for a, pa, b, pb in avist:
+        k = tuple(sorted((a, b)))
+        if k in seguro:
+            if pa:
+                extremo.setdefault((a, pa), k)
+            if pb:
+                extremo.setdefault((b, pb), k)
+    # puertos de cada equipo hacia cada vecino (para ver si alguien esta "en medio")
+    puertos_hacia = {}
+    for a, pa, b, pb in avist:
+        if pa:
+            puertos_hacia.setdefault((a, b), set()).add(pa)
+        if pb:
+            puertos_hacia.setdefault((b, a), set()).add(pb)
+    indirectos = {}
+    for k, t in tipos.items():
+        if t != "eth":
+            indirectos[k] = "visto por una interfaz VLAN" if t == "vlan" else "túnel"
+    # 2) puertos con varios vecinos: fuera los que ya tienen ese extremo ocupado por otro cable
+    #    o los que tienen a otro vecino del mismo puerto en medio
+    for a, pa, b, pb in avist:
+        k = tuple(sorted((a, b)))
+        if k in seguro or k in indirectos:
+            continue
+        motivo = None
+        for (x, px, y, py) in ((a, pa, b, pb), (b, pb, a, pa)):
+            # el puerto del otro lado (y, py) ya esta ocupado por un cable directo con otro equipo
+            if py and extremo.get((y, py)) not in (None, k):
+                motivo = f"{y} {py} ya está conectado directo con otro equipo"
+                break
+            # otro vecino n del mismo puerto ve a x y a y por puertos distintos: n esta en medio
+            if px:
+                for n in occ.get((x, px), set()) - {y}:
+                    hx, hy = puertos_hacia.get((n, x), set()), puertos_hacia.get((n, y), set())
+                    if n in nucleo and hx and hy and not (hx & hy):
+                        motivo = f"{n} está en medio"
+                        break
+            if motivo:
+                break
+        if motivo:
+            indirectos[k] = "a través de otro equipo: " + motivo
+    # 3) un mismo puerto reclamado por varios equipos sin confirmar: queda el que se ve desde los dos lados
+    #    (mas avistamientos distintos del par); los demas estan detras de el
+    distintos = {}
+    for a, pa, b, pb in avist:
+        distintos.setdefault(tuple(sorted((a, b))), set()).add(frozenset([(a, pa), (b, pb)]))
+    reclamos = {}
+    for a, pa, b, pb in avist:
+        k = tuple(sorted((a, b)))
+        if k in seguro or k in indirectos:
+            continue
+        for y, py in ((a, pa), (b, pb)):
+            if py:
+                reclamos.setdefault((y, py), set()).add(k)
+    for (y, py), ks in reclamos.items():
+        ks = {k for k in ks if k not in indirectos}
+        if len(ks) < 2:
+            continue
+        mejor = max(len(distintos[k]) for k in ks)
+        ganadores = [k for k in ks if len(distintos[k]) == mejor]
+        if len(ganadores) == 1:
+            otro = ganadores[0][0] if ganadores[0][1] == y else ganadores[0][1]
+            for k in ks - set(ganadores):
+                indirectos[k] = f"a través de otro equipo: {y} {py} está conectado directo con {otro}"
+    return indirectos
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mapa")
+    ap.add_argument("lista")
+    ap.add_argument("--router", action="append", default=[])
+    ap.add_argument("--switch", action="append", default=[])
+    ap.add_argument("--community", action="append", default=[],
+                    help="Se prueban todas, en orden, en el router, los switches y los equipos")
+    ap.add_argument("--credenciales",
+                    help='JSON {"comunidades": [{"nombre","community"}], "preferencias": {"ip": "nombre"}}')
+    ap.add_argument("--auto-vecinos", action="store_true",
+                    help="Agregar los vecinos LLDP/CDP que no estan en la lista (IP desde el ARP)")
+    ap.add_argument("--barrido", action="store_true",
+                    help="Antes de leer el ARP, hacer ping a las redes privadas conectadas a los routers")
+    ap.add_argument("--puertos-salida",
+                    help="Escribir aqui (JSON) los puertos de cada router/switch, con lo que se ve detras de cada uno")
+    ap.add_argument("-o", "--output")
+    ap.add_argument("--memoria-vlan", help="JSON con las VLANs vistas en cada puerto (ultimos 7 dias)")
+    ap.add_argument("--historial", help="carpeta del historial del mapa (para armar la memoria la primera vez)")
+    ap.add_argument("--cache-olt", help="carpeta con la lista de uplinks de cada OLT (se relee cada 24 h)")
+    a = ap.parse_args()
+    nucleo = list(dict.fromkeys(a.switch + a.router))
+
+    # Credenciales con nombre (para mostrar en la solapa Config) y preferencia por IP
+    nombre_de = {}          # community -> nombre de la credencial
+    preferida = {}          # ip -> community preferida
+    if a.credenciales:
+        cfg_cred = json.loads(Path(a.credenciales).read_text(encoding="utf-8"))
+        for cr in cfg_cred.get("comunidades", []):
+            if cr.get("community") and cr["community"] not in a.community:
+                a.community.append(cr["community"])
+            nombre_de.setdefault(cr.get("community"), cr.get("nombre", ""))
+        por_nombre = {v: k for k, v in nombre_de.items()}
+        preferida = {ip: por_nombre[n] for ip, n in cfg_cred.get("preferencias", {}).items() if n in por_nombre}
+        oc = cfg_cred.get("ocultar", {})
+        OCULTAR["ips"] = {str(x) for x in oc.get("ips", [])}
+        OCULTAR["macs"] = {str(x).lower() for x in oc.get("macs", [])}
+        OCULTAR["ppp"] = oc.get("ppp", True) is not False
+        MANUALES.extend(e for e in cfg_cred.get("enlaces", []) if isinstance(e, dict) and e.get("a") and e.get("b"))
+        if isinstance(cfg_cred.get("api"), dict) and cfg_cred["api"].get("usuario"):
+            API_ROS.update(cfg_cred["api"])
+        # hosts con interfaz SNMP propia (version, puerto y community escritos en la pagina Hosts)
+        for ip, h in cfg_cred.get("hosts", {}).items():
+            CFG_HOST[ip] = {"version": h.get("version", "v2c"), "puerto": int(h.get("puerto") or 161),
+                            "tipo": h.get("tipo", ""), "bloqueados": [str(x) for x in h.get("bloqueados", [])],
+                            "solo_manuales": bool(h.get("solo_manuales")),
+                            "sin_escaneo": bool(h.get("sin_escaneo")),
+                            "bloqueo_ppp": h.get("bloqueo_ppp", True) is not False,
+                            "api_vlans": bool(h.get("api_vlans"))}
+            if h.get("sin_escaneo"):
+                SIN_ESCANEO.add(ip)
+            if h.get("community"):
+                preferida[ip] = h["community"]
+                if h["community"] not in a.community:
+                    a.community.append(h["community"])
+    if not a.community:
+        ap.error("falta al menos una comunidad (--community o --credenciales)")
+
+    def orden_comms(ip):
+        p = preferida.get(ip)
+        return ([p] if p else []) + [c for c in a.community if c != p]
+
+    def info_snmp(c, ip=None):
+        cfg = CFG_HOST.get(ip, {})
+        cred = nombre_de.get(c, "") or ("del host" if c == preferida.get(ip) else "")
+        return {"version": cfg.get("version", "v2c"), "puerto": cfg.get("puerto", 161), "credencial": cred,
+                "community": c}
+
+    # Comunidad que responde en cada equipo de nucleo (se prueba sysName con cada una)
+    _comm_cache = {}
+
+    def comm(host):
+        if host not in _comm_cache:
+            cs = orden_comms(host)
+            ok = en_paralelo(lambda c: bool(snmp_get(host, c, ["1.3.6.1.2.1.1.5.0"], timeout=3)), cs, 8)
+            elegida = next((c for c, b in zip(cs, ok) if b), None)
+            if elegida is None:
+                MUERTOS.add(host)   # no responde SNMP: no se pierden minutos esperando cada tabla
+                print(f"Sin respuesta SNMP: {host}")
+            _comm_cache[host] = elegida or cs[0]
+        return _comm_cache[host]
+
+    # Tablas que se leen de cada router/switch: se piden todas en paralelo (varias por equipo a la vez)
+    OIDS_NUCLEO = [".1.3.6.1.2.1.31.1.1.1.1", ".1.3.6.1.2.1.17.1.4.1.2", ".1.3.6.1.2.1.17.7.1.2.2.1.2",
+                   ".1.3.6.1.2.1.17.7.1.4.5.1.1", ".1.3.6.1.4.1.14988.1.1.11.1.1.2", ".1.3.6.1.4.1.14988.1.1.11.1.1.3",
+                   ".1.3.6.1.4.1.14988.1.1.11.1.1.6", ".1.0.8802.1.1.2.1.3.7.1.4", ".1.0.8802.1.1.2.1.4.1.1.5",
+                   ".1.0.8802.1.1.2.1.4.1.1.7", ".1.0.8802.1.1.2.1.4.1.1.9", ".1.0.8802.1.1.2.1.4.1.1.10",
+                   ".1.0.8802.1.1.2.1.4.2.1.3", ".1.3.6.1.4.1.9.9.23.1.2.1.1.6", ".1.3.6.1.2.1.2.2.1.2",
+                   ".1.3.6.1.2.1.31.1.1.1.18", ".1.3.6.1.2.1.2.2.1.8", ".1.3.6.1.2.1.2.2.1.6",
+                   ".1.3.6.1.2.1.17.2", ".1.3.6.1.2.1.17.1.1"]
+
+    def precargar(pares):
+        t0 = time.time()
+        en_paralelo(lambda p: walk(p[0], comm(p[0]), p[1]), pares, 48)
+        return time.time() - t0
+
+    mapa = json.loads(Path(a.mapa).read_text(encoding="utf-8"))
+    equipos = leer_lista(a.lista)
+    ips = {ip for _, ip, _ in equipos}
+    host_a_nombre = {d.get("node_details", {}).get("ip"): n for n, d in mapa.items()}
+
+    # 0) Comunidad de cada router/switch (en paralelo), luego sus tablas en paralelo con el barrido de ping
+    t0 = time.time()
+    en_paralelo(comm, nucleo, 32)
+    vivos = [h for h in nucleo if h not in MUERTOS]
+    print(f"Tiempo comunidades: {time.time() - t0:.1f} s")
+    # ordenado por tabla y no por equipo: cada equipo recibe pocos pedidos a la vez
+    pares = [(h, o) for o in OIDS_NUCLEO for h in vivos] +[(r, ".1.3.6.1.2.1.4.20.1.3") for r in a.router if r in vivos]
+    with ThreadPoolExecutor(1) as ex_pre:
+        fut = ex_pre.submit(precargar, pares)
+        # barrido de ping para refrescar el ARP de los routers (necesita sus redes: ipAddrTable)
+        if a.barrido:
+            t0 = time.time()
+            redes = sorted({red for r in a.router for red in redes_conectadas(r, comm(r))})
+            if redes:
+                barrido_ping(redes)
+                time.sleep(2)
+            print(f"Tiempo barrido: {time.time() - t0:.1f} s")
+        print(f"Tiempo tablas de routers/switches: {fut.result():.1f} s")
+    t0 = time.time()
+    precargar([(r, ".1.3.6.1.2.1.4.22.1.2") for r in a.router if r in vivos])
+    print(f"Tiempo ARP: {time.time() - t0:.1f} s")
+
+    # 1) ARP completo de los routers: IP -> MAC y MAC -> IP
+    ip_mac, mac_ip = {}, {}
+    for r in a.router:
+        for k, v in walk(r, comm(r), ".1.3.6.1.2.1.4.22.1.2").items():
+            ip = ".".join(k.split(".")[1:])
+            if v and len(v.split()) == 6:
+                mac = ":".join(v.split()).lower()
+                ip_mac.setdefault(ip, mac)
+                mac_ip.setdefault(mac, ip)
+    arp = {ip: ip_mac[ip] for ip in ips if ip in ip_mac}
+    mac_a_ip = {m: ip for ip, m in arp.items()}
+
+    # 2) Tablas de MAC (FDB) de todo el nucleo: MAC -> (equipo, puerto)
+    vistos = {ip: [] for ip in ips}
+    ifnames = {}
+    macs_puerto = {}        # host -> {nombre de puerto: MACs aprendidas}
+    vlans_puerto = {}       # host -> {puerto: {vid: MACs}}  (tabla Bridge > Hosts: el indice empieza por el VID)
+    pvid_puerto = {}        # host -> {puerto: VLAN nativa (PVID)}
+    for host in nucleo:
+        ifname = ifnames[host] = walk(host, comm(host), ".1.3.6.1.2.1.31.1.1.1.1")
+        bp2if = walk(host, comm(host), ".1.3.6.1.2.1.17.1.4.1.2")
+        fdb = walk(host, comm(host), ".1.3.6.1.2.1.17.7.1.2.2.1.2")
+        por_puerto, filas, por_vid = {}, [], {}
+        for k, port in fdb.items():
+            p = k.split(".")
+            if len(p) < 7:
+                continue
+            mac = ":".join(f"{int(x):02x}" for x in p[1:7])
+            por_puerto[port] = por_puerto.get(port, 0) + 1
+            filas.append((mac, port))
+            if p[0].isdigit() and 0 < int(p[0]) < 4095:
+                cnt = por_vid.setdefault(port, {})
+                cnt[p[0]] = cnt.get(p[0], 0) + 1
+        macs_puerto[host] = {ifname.get(bp2if.get(p, p), "bridgeport" + p): n for p, n in por_puerto.items()}
+
+        def nombre_bp(p):
+            return "bridge" if p == "0" else ifname.get(bp2if.get(p, p), "bridgeport" + p)
+        vlans_puerto[host] = {nombre_bp(p): c for p, c in por_vid.items()}
+        pvid_puerto[host] = {nombre_bp(p): v for p, v in walk(host, comm(host), ".1.3.6.1.2.1.17.7.1.4.5.1.1").items()
+                             if v.isdigit() and 0 < int(v) < 4095}
+        for mac, port in filas:
+            if mac in mac_a_ip:
+                vistos[mac_a_ip[mac]].append({"equipo": host_a_nombre.get(host, host),
+                                              "puerto": ifname.get(bp2if.get(port, port), "bridgeport" + port),
+                                              "macs": por_puerto[port]})
+
+    # 3) Vecinos LLDP y CDP de todo el nucleo, y tabla /ip neighbor de MikroTik (MNDP/CDP/LLDP con IP)
+    vecinos = []   # {equipo, puerto, remoto, sysname, sysdesc, chassis(int|None), ip}
+    nb_mac_ip, nb_nombre_ip = {}, {}
+    for host in nucleo:
+        c = comm(host)
+        nombre_host = host_a_nombre.get(host, host)
+        # MIKROTIK-MIB mtxrNeighborTable: .2 IP, .3 MAC, .6 identity (otros fabricantes: tabla vacia)
+        nb_ip = walk(host, c, ".1.3.6.1.4.1.14988.1.1.11.1.1.2")
+        if nb_ip:
+            nb_mac = walk(host, c, ".1.3.6.1.4.1.14988.1.1.11.1.1.3")
+            nb_id = walk(host, c, ".1.3.6.1.4.1.14988.1.1.11.1.1.6")
+            for idx, ip in nb_ip.items():
+                if not ip or ip == "0.0.0.0":
+                    continue
+                m = mac_int(nb_mac.get(idx, ""))
+                if m is not None:
+                    nb_mac_ip.setdefault(mac_txt(m), ip)
+                if nb_id.get(idx):
+                    nb_nombre_ip.setdefault(nb_id[idx], ip)
+        ifname = ifnames.get(host) or walk(host, c, ".1.3.6.1.2.1.31.1.1.1.1")
+        locdesc = walk(host, c, ".1.0.8802.1.1.2.1.3.7.1.4")
+        chassis = walk(host, c, ".1.0.8802.1.1.2.1.4.1.1.5")
+        rport = walk(host, c, ".1.0.8802.1.1.2.1.4.1.1.7")
+        rname = walk(host, c, ".1.0.8802.1.1.2.1.4.1.1.9")
+        rdesc = walk(host, c, ".1.0.8802.1.1.2.1.4.1.1.10")
+        manip = {}
+        for k in walk(host, c, ".1.0.8802.1.1.2.1.4.2.1.3"):
+            p = k.split(".")   # timeMark.localPort.index.subtipo.largo.direccion
+            if len(p) >= 9 and p[3] == "1" and p[4] == "4":
+                manip[".".join(p[:3])] = ".".join(p[5:9])
+        for idx, ch in chassis.items():
+            loc = idx.split(".")[1]
+            vecinos.append({"equipo": nombre_host, "puerto": locdesc.get(loc) or ifname.get(loc) or f"port{loc}",
+                            "remoto": rport.get(idx, ""), "sysname": rname.get(idx, ""),
+                            "sysdesc": rdesc.get(idx, ""), "chassis": mac_int(ch), "ip": manip.get(idx, "")})
+        # CDP (Cisco y equipos compatibles): da IP, no MAC
+        cdp_id = walk(host, c, ".1.3.6.1.4.1.9.9.23.1.2.1.1.6")
+        if cdp_id:
+            cdp_port = walk(host, c, ".1.3.6.1.4.1.9.9.23.1.2.1.1.7")
+            cdp_addr = walk(host, c, ".1.3.6.1.4.1.9.9.23.1.2.1.1.4")
+            cdp_plat = walk(host, c, ".1.3.6.1.4.1.9.9.23.1.2.1.1.8")
+            for idx, dev in cdp_id.items():
+                hx = re.sub(r"[^0-9a-fA-F]", "", cdp_addr.get(idx, ""))
+                ip = ".".join(str(int(hx[i:i + 2], 16)) for i in range(0, 8, 2)) if len(hx) == 8 else ""
+                vecinos.append({"equipo": nombre_host, "puerto": ifname.get(idx.split(".")[0], ""),
+                                "remoto": cdp_port.get(idx, ""), "sysname": dev, "sysdesc": cdp_plat.get(idx, ""),
+                                "chassis": mac_int(ip_mac.get(ip, "")), "ip": ip})
+
+    # 3b) Relacionar cada vecino con un equipo de la lista. Los Dahua anuncian MAC base + numero de puerto.
+    base_lista = {ip: mac_int(m) for ip, m in arp.items()}
+    lldp = {ip: [] for ip in ips}
+    no_listados = []
+    for v in vecinos:
+        m_num = re.search(r"(\d+)$", v["remoto"])
+        destino = v["ip"] if v["ip"] in ips else None
+        if not destino and v["chassis"] is not None:
+            for ip, base in base_lista.items():
+                diff = v["chassis"] - base
+                if diff == 0 or (0 < diff <= 64 and (not m_num or int(m_num.group(1)) == diff)):
+                    destino = ip
+                    break
+        if destino:
+            lldp[destino].append({"equipo": v["equipo"], "puerto": v["puerto"], "remoto": v["remoto"] or "uplink"})
+        else:
+            # MAC base: en switches tipo Dahua (puerto "GigabitEthernet1/0/N") el chassis es base + N
+            m_dh = re.search(r"Ethernet\d+/\d+/(\d+)$", v["remoto"])
+            v["base"] = (v["chassis"] - int(m_dh.group(1))) if (v["chassis"] is not None and m_dh) else v["chassis"]
+            no_listados.append(v)
+
+    # 4) Modelo por SNMP de los equipos de la lista (en paralelo)
+    def sondear(ip):
+        if ip in SIN_ESCANEO:
+            return ip, None
+        cs = orden_comms(ip)
+        res = en_paralelo(lambda c: snmp_get(ip, c, ["1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.1.1.0"]), cs, 8)
+        for c, r in zip(cs, res):
+            if r:
+                return ip, {"sysname": r[0], "sysdescr": r[1] if len(r) > 1 else "", "community": c}
+        return ip, None
+    with ThreadPoolExecutor(32) as ex:
+        snmp = dict(ex.map(sondear, ips))
+
+    # 5) Quitar nodos fusionados/duplicados con esas IPs (y referencias a ellos)
+    quitar = {n for n, d in mapa.items() if d.get("node_details", {}).get("ip") in ips}
+    for n in quitar:
+        mapa.pop(n)
+    for d in mapa.values():
+        for n in quitar:
+            d.get("peers", {}).pop(n, None)
+
+    def enlazar(nombre, equipo, puerto, remoto, **extra):
+        if equipo not in mapa:
+            return
+        for a_, b_, l, r in ((nombre, equipo, remoto, puerto), (equipo, nombre, puerto, remoto)):
+            p = mapa[a_].setdefault("peers", {}).setdefault(b_, {"connections": []})
+            if [l, r] not in p["connections"]:
+                p["connections"].append([l, r])
+            p.update(extra)
+
+    # OLT: solo sus uplinks. La lista de interfaces se lee una vez al dia (cache); en cada actualizacion solo
+    # se pide el estado, la velocidad y la descripcion de esos uplinks (un snmpget). Los puertos PON / ONU se descartan.
+    PON = re.compile(r"pon|onu|\bont|ont[-_]|epon|xgs|:\d+$", re.I)
+    LOGICO_OLT = re.compile(r"^(lo|loopback|null|inloopback|vlan|vlanif|vif|tunnel|console|aux|virtual|bridge|br\d|dummy|sit|ip6tnl|bond|trunk|eth-trunk|lag)", re.I)
+    UPLINK = re.compile(r"eth|ge|xe|giga|ten|uplink|sfp|nni|port|mgmt|meth|\d+/\d+", re.I)
+    def es_uplink(n):
+        n = (n or "").strip()
+        return bool(n) and not PON.search(n) and not LOGICO_OLT.match(n) and bool(UPLINK.search(n))
+    inv_olt = {}
+    def uplinks_olt(ip, c):
+        cache = Path(a.cache_olt) / f"{ip}.json" if a.cache_olt else None
+        ups = None
+        if cache and cache.exists():
+            try:
+                d = json.loads(cache.read_text(encoding="utf-8"))
+                if time.time() - d.get("ts", 0) < 86400:
+                    ups = d["uplinks"]
+            except (ValueError, KeyError, OSError):
+                ups = None
+        if ups is None:
+            nombres = walk(ip, c, ".1.3.6.1.2.1.31.1.1.1.1") or walk(ip, c, ".1.3.6.1.2.1.2.2.1.2")
+            num = lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)]
+            ups = sorted(({"idx": k, "nombre": v} for k, v in nombres.items() if k.isdigit() and es_uplink(v)),
+                         key=lambda u: num(u["nombre"]))[:64]
+            if cache and nombres:
+                try:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_text(json.dumps({"ts": time.time(), "uplinks": ups}), encoding="utf-8")
+                except OSError:
+                    pass
+        res = []
+        for i in range(0, len(ups), 10):
+            parte = ups[i:i + 10]
+            oids = [f"1.3.6.1.2.1.{o}.{u['idx']}" for u in parte for o in ("2.2.1.8", "31.1.1.1.15", "31.1.1.1.18")]
+            vals = snmp_get(ip, c, oids, timeout=3) or []
+            vals = vals if len(vals) == len(oids) else [""] * len(oids)
+            for j, u in enumerate(parte):
+                est, vel, ali = (v if "No Such" not in v else "" for v in vals[3 * j:3 * j + 3])
+                res.append({"nombre": u["nombre"], "estado": {"1": "up", "2": "down"}.get(est, est or "?"),
+                            "velocidad": f"{int(vel) // 1000} G" if vel.isdigit() and int(vel) >= 1000 else (f"{vel} M" if vel.isdigit() and int(vel) else ""),
+                            "alias": ali})
+        return res
+
+    # 6) Equipos de la lista y sus enlaces (activo / respaldo RSTP)
+    resumen = []
+    for nombre, ip, _ in equipos:
+        s = snmp.get(ip)
+        mac = arp.get(ip, "")
+        acceso = min(vistos.get(ip, []), key=lambda x: x["macs"], default=None)
+        if s:
+            platform, estado = s["sysdescr"] or "SNMP", "SNMP ok"
+        elif mac:
+            platform, estado = "Sin SNMP", "sin SNMP, MAC por ARP"
+        else:
+            platform, estado = "Sin respuesta", "sin ARP (apagado o desconectado)"
+        cfg_h = CFG_HOST.get(ip, {})
+        if ip in SIN_ESCANEO:
+            platform, estado = "Solo dibujado", "solo dibujado (no se escanea)"
+        meta = {"mac": mac or "-", "estado": estado, "fijo": True,
+                "tipo": cfg_h.get("tipo") if cfg_h.get("tipo") in ("acceso", "otro", "olt") else "acceso"}
+        if ip in SIN_ESCANEO:
+            meta["sin_escaneo"] = True
+            meta["snmp"] = {"version": "-", "puerto": "-", "credencial": "", "community": "",
+                            "nota": "no se escanea (solo dibujado en el mapa)"}
+        elif s:
+            meta["sysName"] = s["sysname"]
+            meta["snmp"] = info_snmp(s["community"], ip)
+        else:
+            meta["snmp"] = {"version": "-", "puerto": cfg_h.get("puerto", 161),
+                            "credencial": nombre_de.get(preferida.get(ip), ""),
+                            "community": preferida.get(ip, "") if ip in CFG_HOST else "",
+                            "nota": "no responde SNMP con ninguna comunidad"}
+        mapa[nombre] = {"node_details": {"ip": ip, "platform": platform, "model": platform, "metadata": meta},
+                        "peers": {}}
+        if cfg_h.get("tipo") == "olt" and s:
+            try:
+                meta["uplinks"] = uplinks_olt(ip, s["community"])
+            except Exception as e:
+                meta["uplinks"], meta["uplinks_error"] = [], str(e)[:80]
+            inv_olt[ip] = {"nodo": nombre, "puertos": [{"nombre": u["nombre"], "alias": u["alias"], "estado": u["estado"],
+                                                         "logico": False, "vecinos": [], "macs": 0}
+                                                        for u in meta["uplinks"]]}
+        enlaces = lldp.get(ip) or ([{"equipo": acceso["equipo"], "puerto": acceso["puerto"], "remoto": "uplink"}]
+                                   if acceso else [])
+        textos = []
+        for e in enlaces:
+            if e["equipo"] not in mapa:
+                continue
+            activo = bool(acceso) and acceso["equipo"] == e["equipo"] and acceso["puerto"] == e["puerto"]
+            estado_rstp = "activo" if activo or not acceso else "respaldo"
+            remoto = e["remoto"] + ("" if estado_rstp == "activo" else " (respaldo RSTP)")
+            mapa[nombre]["peers"][e["equipo"]] = {"connections": [[remoto, e["puerto"]]], "rstp": estado_rstp}
+            mapa[e["equipo"]].setdefault("peers", {})[nombre] = {"connections": [[e["puerto"], remoto]],
+                                                                  "rstp": estado_rstp}
+            textos.append(f"{e['equipo']} {e['puerto']} [{estado_rstp}]")
+        if textos:
+            meta["enlaces"] = "; ".join(textos)
+        resumen.append((nombre, ip, mac or "-", estado, "; ".join(textos) or "-"))
+
+    # 7) Vecinos no listados: agregados automaticamente (IP por ARP) o "Sin IP"
+    auto, sin_ip = [], []
+    descubiertos = {n for n, d in mapa.items() if d.get("node_details")}
+    ips_en_mapa = {d.get("node_details", {}).get("ip") for d in mapa.values()}
+    def es_generico(s):
+        s = (s or "").strip()
+        return s.lower() in GENERICOS or bool(re.fullmatch(r"[0-9a-fA-F:]{8,}", s))
+
+    # primera pasada: IP y MAC de cada vecino. Fuentes en orden: LLDP (IP de gestion), ARP, /ip neighbor
+    for v in no_listados:
+        ip = v["ip"] if v["ip"] and not ipaddress.ip_address(v["ip"]).is_link_local else ""
+        fuente = "LLDP" if ip else ""
+        mac = mac_txt(v["base"]) if v["base"] is not None else ""
+        if not ip and v["chassis"] is not None:
+            chas = mac_txt(v["chassis"])
+            # si la MAC base sale de restar el puerto (Dahua), se conserva la base para identificar al equipo
+            con_offset = v["base"] != v["chassis"]
+            ip = mac_ip.get(mac, "") or mac_ip.get(chas, "")
+            if ip:
+                fuente = "ARP"
+                if not mac_ip.get(mac) and not con_offset:
+                    mac = chas
+            else:
+                ip = nb_mac_ip.get(chas, "") or nb_mac_ip.get(mac, "")
+                if ip:
+                    fuente = "IP neighbor"
+                    if not nb_mac_ip.get(mac) and not con_offset:
+                        mac = chas
+        if not ip and not es_generico(v["sysname"]) and nb_nombre_ip.get(v["sysname"]):
+            ip, fuente = nb_nombre_ip[v["sysname"]], "IP neighbor"
+        v["ip_r"], v["mac_r"], v["fuente"] = ip, mac, fuente
+    # segunda pasada: el mismo equipo visto por otra interfaz hereda la IP (misma MAC o mismo nombre)
+    ip_por_mac = {v["mac_r"]: v["ip_r"] for v in no_listados if v["ip_r"] and v["mac_r"]}
+    ip_por_nombre = {v["sysname"]: v["ip_r"] for v in no_listados if v["ip_r"] and not es_generico(v["sysname"])}
+    fuente_por_mac = {v["mac_r"]: v["fuente"] for v in no_listados if v["ip_r"] and v["mac_r"]}
+    for v in no_listados:
+        if not v["ip_r"]:
+            v["ip_r"] = ip_por_mac.get(v["mac_r"]) or (ip_por_nombre.get(v["sysname"], "")
+                                                      if not es_generico(v["sysname"]) else "")
+            v["fuente"] = fuente_por_mac.get(v["mac_r"], "IP neighbor") if v["ip_r"] else ""
+
+    # equipo del mapa que ya tiene cada IP, con su MAC (para detectar IP duplicadas)
+    dueno_ip = {}
+    for n, d in mapa.items():
+        nd = d.get("node_details") or {}
+        if nd.get("ip"):
+            dueno_ip[nd["ip"]] = (n, (nd.get("metadata") or {}).get("mac", "") or ip_mac.get(nd["ip"], ""))
+
+    grupos = {}
+    for v in no_listados:
+        ip, mac = v["ip_r"], v["mac_r"]
+        if v["sysname"] in descubiertos:
+            continue   # ya esta en el mapa (router/switch recorrido)
+        conflicto = None
+        if ip and ip in dueno_ip:
+            otro, mac_otro = dueno_ip[ip]
+            if mac and mac_otro and mac_otro not in ("-", mac) and v["fuente"] != "ARP":
+                conflicto = otro      # el vecino anuncia una IP que tiene otro equipo (otra MAC)
+            else:
+                continue              # es el mismo equipo que ya esta en el mapa
+        clave = (mac or ip) if conflicto else (ip or mac or f"{v['sysname']}|{v['equipo']}|{v['puerto']}")
+        g = grupos.setdefault(clave, {"ip": ip, "mac": mac or (ip_mac.get(ip, "") if ip else ""),
+                                      "sysname": v["sysname"], "sysdesc": v["sysdesc"], "enlaces": [],
+                                      "fuente": v["fuente"], "conflicto": conflicto})
+        g["sysdesc"] = g["sysdesc"] or v["sysdesc"]
+        g["sysname"] = g["sysname"] if not es_generico(g["sysname"]) else (v["sysname"] or g["sysname"])
+        g["enlaces"].append((v["equipo"], v["puerto"], v["remoto"] or "uplink"))
+
+    # nombres de placeholders existentes (vecinos que el recorrido ya dibujo sin datos)
+    placeholders = {p for d in mapa.values() for p in d.get("peers", {}) if p not in mapa}
+    usados = set(mapa)
+    for clave, g in grupos.items():
+        sysn = g["sysname"].strip()
+        generico = es_generico(sysn)
+        if not a.auto_vecinos and not g["ip"]:
+            continue
+        if g["ip"] and a.auto_vecinos:
+            if g["conflicto"]:
+                nombre = f"{sysn or 'Equipo'} (IP duplicada {g['ip']})"
+                estado = f"auto: IP duplicada, {g['ip']} también la tiene {g['conflicto']}"
+                otro = mapa.get(g["conflicto"], {}).get("node_details", {}).setdefault("metadata", {})
+                otro["ip_duplicada"] = f"{g['ip']} también la anuncia {g['mac']} ({sysn or 'sin nombre'})"
+            else:
+                nombre = sysn if (sysn and not generico and sysn not in usados) else f"{sysn or 'Equipo'} {g['ip']}"
+                estado = f"auto: vecino LLDP/CDP, IP por {g['fuente'] or 'LLDP'}"
+            platform = g["sysdesc"] or "Vecino LLDP"
+            auto.append((nombre, g["ip"], g["mac"] or "-", (g["fuente"] or "LLDP"), platform[:40]))
+        elif not g["ip"] and g["mac"]:
+            nombre = f"Sin IP {g['mac']}"
+            estado, platform = "vecino LLDP sin IP (ni en ARP ni en IP neighbor)", "Sin respuesta"
+            sin_ip.append((nombre, g["mac"], sysn))
+        else:
+            continue
+        # placeholder del recorrido con el mismo sysName: se reemplaza por el nodo con datos
+        if sysn in placeholders and nombre != sysn:
+            for d in mapa.values():
+                if sysn in d.get("peers", {}):
+                    d["peers"].pop(sysn)
+        usados.add(nombre)
+        meta = {"mac" if g["ip"] else "mac_base": g["mac"] or "-", "estado": estado, "sysName_lldp": sysn or "-",
+                "fijo": False}
+        if g["ip"]:
+            meta["ip_segun"] = g["fuente"] or "LLDP"
+            meta["snmp_pendiente"] = True     # se sondea despues, en paralelo
+        if g["conflicto"]:
+            meta["ip_duplicada"] = f"{g['ip']} también la tiene {g['conflicto']}"
+        mapa[nombre] = {"node_details": {"ip": g["ip"], "platform": platform, "model": platform, "metadata": meta},
+                        "peers": {}}
+        # preferir puertos fisicos; las interfaces vlan/bridge solo si no hay otra
+        enl = g["enlaces"]
+        fisicos = [e for e in enl if not es_logica(e[1])]
+        for equipo, puerto, remoto in enl:
+            # quitar el nodo provisional (sin datos) que el recorrido dejo en ese mismo puerto
+            for p in [p for p, d in mapa.get(equipo, {}).get("peers", {}).items()
+                      if p not in mapa and any(c and c[0] == puerto for c in d.get("connections", []))]:
+                mapa[equipo]["peers"].pop(p)
+        for equipo, puerto, remoto in (fisicos or enl):
+            enlazar(nombre, equipo, puerto, remoto)
+        meta["enlaces"] = "; ".join(f"{e} {p}" for e, p, _ in (fisicos or enl))
+
+    # Provisionales que el recorrido nombro con la MAC en hexadecimal ("37:43:3a..." = "7C:...")
+    macs_nuevas = {d["node_details"].get("metadata", {}).get(k, "").lower()
+                   for d in mapa.values() if d.get("node_details") for k in ("mac", "mac_base")}
+    for d in mapa.values():
+        for p in [p for p in d.get("peers", {}) if p not in mapa]:
+            if re.fullmatch(r"([0-9a-fA-F]{2}:)+[0-9a-fA-F]{2}", p):
+                try:
+                    texto = bytes(int(x, 16) for x in p.split(":")).decode("ascii").lower()
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if texto in macs_nuevas:
+                    d["peers"].pop(p)
+
+    # SNMP de los vecinos automaticos (comunidad y version para la solapa Config)
+    pendientes = [d["node_details"] for d in mapa.values()
+                  if (d.get("node_details") or {}).get("metadata", {}).pop("snmp_pendiente", False)]
+    if pendientes:
+        t0 = time.time()
+        with ThreadPoolExecutor(32) as ex:
+            res = dict(ex.map(sondear, {nd["ip"] for nd in pendientes}))
+        print(f"Tiempo SNMP de vecinos ({len(res)}): {time.time() - t0:.1f} s")
+        for nd in pendientes:
+            s = res.get(nd["ip"])
+            if s:
+                nd["metadata"]["snmp"] = info_snmp(s["community"], nd["ip"])
+                if nd.get("platform") in ("Vecino LLDP", "") and s["sysdescr"]:
+                    nd["platform"] = nd["model"] = s["sysdescr"][:80]
+            else:
+                nd["metadata"]["snmp"] = {"version": "-", "credencial": "", "community": "",
+                                          "nota": "no responde SNMP con ninguna comunidad"}
+
+    # Equipos de nucleo (router/switch recorridos): fijos, con la comunidad que respondio
+    for d in mapa.values():
+        nd = d.get("node_details") or {}
+        if nd.get("ip") in nucleo:
+            meta = nd.setdefault("metadata", {})
+            meta.update({"fijo": True, "tipo": "router" if nd["ip"] in a.router else "switch",
+                         "snmp": info_snmp(comm(nd["ip"]), nd["ip"])})
+
+    # Enlaces manuales: unen dos equipos del mapa (por IP). Un host marcado "usar solo enlaces manuales"
+    # (y que no es router/switch recorrido) pierde los enlaces deducidos (tabla de MAC, LLDP) y queda con los manuales.
+    if MANUALES:
+        por_ip = {(d.get("node_details") or {}).get("ip"): n for n, d in mapa.items()
+                  if (d.get("node_details") or {}).get("ip")}
+        nucleo_ips = set(nucleo)
+        validos = [(por_ip[e["a"]], e.get("pa") or "", por_ip[e["b"]], e.get("pb") or "",
+                    "respaldo" if e.get("rol") == "respaldo" else "activo")
+                   for e in MANUALES if e["a"] in por_ip and e["b"] in por_ip and por_ip[e["a"]] != por_ip[e["b"]]]
+        textos_m, solo = {}, set()
+        for na, pa, nb, pb, _ in validos:
+            for n_ in (na, nb):
+                ip_n = mapa[n_]["node_details"].get("ip")
+                if ip_n not in nucleo_ips:
+                    textos_m.setdefault(n_, set())
+                    if CFG_HOST.get(ip_n, {}).get("solo_manuales"):
+                        solo.add(n_)
+        # quitar los enlaces deducidos de esos equipos, en los dos sentidos
+        for d in mapa.values():
+            for vec in [v for v in d.get("peers", {}) if v in solo and not d["peers"][v].get("manual")]:
+                d["peers"].pop(vec)
+        for n_ in solo:
+            for vec in [v for v, p in mapa[n_].get("peers", {}).items() if not p.get("manual")]:
+                mapa[n_]["peers"].pop(vec)
+        for na, pa, nb, pb, rol in validos:
+            la, lb = pa or "manual", pb or "manual"
+            for x, y, l, r in ((na, nb, la, lb), (nb, na, lb, la)):
+                p = mapa[x].setdefault("peers", {}).get(y)
+                if not p or not p.get("manual"):
+                    p = mapa[x]["peers"][y] = {"connections": [], "manual": True, "rstp": rol}
+                elif rol == "activo":
+                    p["rstp"] = "activo"     # entre los mismos equipos manda el principal
+                if [l, r] not in p["connections"]:
+                    p["connections"].append([l, r])
+            for x, y, l in ((na, nb, pb), (nb, na, pa)):
+                if x in textos_m:
+                    textos_m[x].add(f"{y}{' ' + l if l else ''} [manual{', respaldo' if rol == 'respaldo' else ''}]")
+        for n_, textos in textos_m.items():
+            md = mapa[n_]["node_details"].setdefault("metadata", {})
+            previos = [] if n_ in solo else [x for x in (md.get("enlaces") or "").split("; ") if x and x != "-"]
+            md["enlaces"] = "; ".join(previos + sorted(textos)) or "-"
+        print(f"Enlaces manuales: {len(validos)} dibujados de {len(MANUALES)} (los demas tienen algun extremo fuera de este mapa)")
+
+    # Puertos de cada router/switch y puertos bloqueados desde la pagina Hosts
+    def norm(p):
+        return re.sub(r"\s+", "", re.sub(r"\s*\(respaldo RSTP\)$", "", p or "")).lower()
+
+    def coincide(puerto, bloqueados):
+        """'BR-Local/ether8' coincide con 'ether8' (puerto dentro de un bridge de MikroTik)."""
+        n = norm(puerto)
+        return any(n == b or n.endswith("/" + b) for b in bloqueados)
+
+    nodo_de_ip = {(d.get("node_details") or {}).get("ip"): n for n, d in mapa.items() if d.get("node_details")}
+
+    # Puertos informados como MAC: el LLDP de algunos MikroTik da la MAC del puerto local en vez de su nombre.
+    # Se cambian por el nombre de la interfaz: primero con la tabla de interfaces (ifPhysAddress) del equipo que
+    # hizo el descubrimiento; si no se puede, con el puerto que informa el otro extremo del mismo enlace.
+    def mac_de(x):
+        x = re.sub(r"\s*\(respaldo RSTP\)$", "", (x or "").strip())
+        if re.fullmatch(r"([0-9a-fA-F]{2}:){6,}[0-9a-fA-F]{2}", x):      # MAC escrita como texto en hexadecimal
+            try:
+                txt = bytes(int(h, 16) for h in x.split(":")).decode("ascii")
+                if MAC.match(txt):
+                    x = txt
+            except (ValueError, UnicodeDecodeError):
+                pass
+        h = re.sub(r"[^0-9a-fA-F]", "", x)
+        return h.lower() if len(h) == 12 and MAC.match(x) else None
+
+    mac_puerto = {}         # nodo -> {mac: nombre de la interfaz}
+    for host in nucleo:
+        nodo = nodo_de_ip.get(host)
+        if not nodo:
+            continue
+        ifname = ifnames.get(host) or walk(host, comm(host), ".1.3.6.1.2.1.31.1.1.1.1")
+        tabla = {}
+        for idx, v in walk(host, comm(host), ".1.3.6.1.2.1.2.2.1.6").items():
+            m_, nombre = mac_de(v), ifname.get(idx)
+            if m_ and nombre and nombre != "lo":
+                tabla.setdefault(m_, []).append(nombre)
+        for m_, nombres in tabla.items():
+            fisicos = [n for n in nombres if puerto_fisico(n)]
+            if len(fisicos) == 1 or (not fisicos and len(nombres) == 1):   # si la MAC es de varios puertos, no se adivina
+                mac_puerto.setdefault(nodo, {})[m_] = (fisicos or nombres)[0]
+
+    def por_tabla(x, nodo):
+        m_ = mac_de(x)
+        return mac_puerto.get(nodo, {}).get(m_, x) if m_ else x
+
+    for n_, d in mapa.items():
+        for vec, p in d.get("peers", {}).items():
+            p["connections"] = [[por_tabla(cn[0], n_), por_tabla(cn[1], vec)] + cn[2:] if len(cn) > 1 else cn
+                                for cn in p.get("connections", [])]
+    arreglados = 0
+    for n_, d in mapa.items():
+        for vec, p in d.get("peers", {}).items():
+            back = [c for c in (mapa.get(vec, {}).get("peers", {}).get(n_) or {}).get("connections", []) if len(c) > 1]
+            nuevas, vistas = [], set()
+            for cn in p.get("connections", []):
+                if len(cn) > 1:
+                    l, r = cn[0], cn[1]
+                    if mac_de(l):        # el otro extremo dice a que puerto mio llega
+                        c = [b for b in back if not mac_de(b[1]) and (len(back) == 1 or miembro(b[0]) == miembro(r))]
+                        if c:
+                            l, arreglados = c[0][1], arreglados + 1
+                    if mac_de(r):        # y yo se a que puerto suyo llego
+                        c = [b for b in back if not mac_de(b[0]) and (len(back) == 1 or miembro(b[1]) == miembro(l))]
+                        if c:
+                            r, arreglados = c[0][0], arreglados + 1
+                    # lo que sigue siendo MAC (equipo sin SNMP que no informa nombres) queda escrito igual: AA:BB:...
+                    l, r = [":".join(re.findall("..", mac_de(x))).upper() if mac_de(x) else x for x in (l, r)]
+                    cn = [l, r] + cn[2:]
+                    clave = (miembro(l).lower(), miembro(r).lower())
+                    if clave in vistas:
+                        continue
+                    vistas.add(clave)
+                nuevas.append(cn)
+            p["connections"] = nuevas
+    quedan_mac = sum(1 for d in mapa.values() for p in d.get("peers", {}).values()
+                     for cn in p.get("connections", []) if any(mac_de(x) for x in cn[:2]))
+    print(f"Puertos informados como MAC: {sum(len(v) for v in mac_puerto.values())} MACs de interfaz conocidas; "
+          f"{arreglados} resueltos por el otro extremo; quedan {quedan_mac} conexiones con MAC")
+    equivalentes = {}       # host -> {nombre normalizado: nombres del mismo puerto (ifName, ifDescr, LLDP)}
+    inventario = {}
+    for host in nucleo:
+        c, nodo = comm(host), nodo_de_ip.get(host)
+        ifname = ifnames.get(host) or walk(host, c, ".1.3.6.1.2.1.31.1.1.1.1")
+        ifdescr = walk(host, c, ".1.3.6.1.2.1.2.2.1.2")
+        alias = walk(host, c, ".1.3.6.1.2.1.31.1.1.1.18")
+        oper = walk(host, c, ".1.3.6.1.2.1.2.2.1.8")
+        locdesc = walk(host, c, ".1.0.8802.1.1.2.1.3.7.1.4")
+        detras = {}
+        for vec, p in (mapa.get(nodo, {}).get("peers", {}).items() if nodo else []):
+            for cn in p.get("connections", []):
+                if cn:
+                    detras.setdefault(norm(cn[0]), set()).add(vec)
+        eq, puertos = {}, []
+        for idx in sorted(set(ifname) | set(ifdescr), key=lambda x: int(x) if x.isdigit() else 0):
+            nombre = ifname.get(idx) or ifdescr.get(idx, "")
+            if not nombre or nombre == "lo":
+                continue
+            nombres = {norm(x) for x in (nombre, ifdescr.get(idx), locdesc.get(idx)) if x}
+            for x in nombres:
+                eq[x] = nombres
+            vec = set()
+            for k, vs in detras.items():
+                if coincide(k, nombres):
+                    vec |= vs
+            puertos.append({"nombre": nombre, "alias": alias.get(idx, ""),
+                            "estado": {"1": "up", "2": "down"}.get(oper.get(idx, ""), oper.get(idx, "") or "?"),
+                            "logico": es_logica(nombre), "vecinos": sorted(vec),
+                            "macs": macs_puerto.get(host, {}).get(nombre, 0)})
+        equivalentes[host] = eq
+        inventario[host] = {"nodo": nodo or host, "puertos": puertos}
+    inventario.update(inv_olt)      # uplinks de las OLT: sugerencias de puerto en los enlaces manuales
+    if a.puertos_salida:
+        Path(a.puertos_salida).write_text(json.dumps({"fecha": time.strftime("%Y-%m-%d %H:%M"), "equipos": inventario},
+                                                     ensure_ascii=False), encoding="utf-8")
+
+    # Bloqueo: se quitan los enlaces de esos puertos y lo que queda detras (sin otro camino a un router/switch)
+    nucleo_nodos = {nodo_de_ip[h] for h in nucleo if h in nodo_de_ip}
+    semillas, cortados = set(), []
+    for host in nucleo:
+        nodo = nodo_de_ip.get(host)
+        pedidos = CFG_HOST.get(host, {}).get("bloqueados") or []
+        if not nodo or not pedidos:
+            continue
+        bset = set()
+        for b in pedidos:
+            bset |= equivalentes.get(host, {}).get(norm(b), {norm(b)})
+        for vec, p in list(mapa[nodo].get("peers", {}).items()):
+            if p.get("manual"):     # un enlace manual lo dibujo el usuario a proposito: no lo quita un puerto bloqueado
+                continue
+            conns = p.get("connections", [])
+            quedan = [cn for cn in conns if not (cn and coincide(cn[0], bset))]
+            if len(quedan) == len(conns):
+                continue
+            cortados.append(f"{nodo} -> {vec}")
+            semillas.add(vec)
+            if quedan:
+                p["connections"] = quedan
+            else:
+                mapa[nodo]["peers"].pop(vec)
+            otro = mapa.get(vec, {}).get("peers", {}).get(nodo)
+            if otro is not None:
+                q2 = [cn for cn in otro.get("connections", []) if not (len(cn) > 1 and coincide(cn[1], bset))]
+                if q2 and quedan:
+                    otro["connections"] = q2
+                else:
+                    mapa[vec]["peers"].pop(nodo)
+            # el texto "Enlaces" del equipo ya no menciona el puerto bloqueado
+            md = (mapa.get(vec, {}).get("node_details") or {}).get("metadata") or {}
+            if md.get("enlaces"):
+                md["enlaces"] = "; ".join(x for x in md["enlaces"].split("; ")
+                                          if not (x.startswith(nodo + " ") and
+                                                  coincide(x[len(nodo) + 1:].split(" [")[0], bset))) or "-"
+    # Equipos ocultos en este mapa: se quitan, junto con lo que solo cuelga de ellos
+    escondidos = set()
+    if OCULTAR["ips"] or OCULTAR["macs"]:
+        for n, d in mapa.items():
+            nd = d.get("node_details") or {}
+            md = nd.get("metadata") or {}
+            macs = {str(md.get(k, "")).lower() for k in ("mac", "mac_base")} - {"", "-"}
+            if (nd.get("ip") and nd["ip"] in OCULTAR["ips"]) or macs & OCULTAR["macs"]:
+                escondidos.add(n)
+        for n, d in mapa.items():
+            if n in escondidos:
+                semillas.update(v for v in d.get("peers", {}) if v in mapa and v not in escondidos)
+            elif escondidos & set(d.get("peers", {})):
+                semillas.add(n)
+        for n in escondidos:
+            mapa.pop(n)
+        for d in mapa.values():
+            for n in escondidos & set(d.get("peers", {})):
+                d["peers"].pop(n)
+        nucleo_nodos -= escondidos
+    ocultos = set()
+    if semillas:
+        vecinos_de = {}
+        for n, d in mapa.items():
+            for v in d.get("peers", {}):
+                vecinos_de.setdefault(n, set()).add(v)
+                vecinos_de.setdefault(v, set()).add(n)
+        for sem in semillas - nucleo_nodos:
+            grupo, pila = {sem}, [sem]
+            while pila:
+                for v in vecinos_de.get(pila.pop(), ()):
+                    if v not in grupo:
+                        grupo.add(v)
+                        pila.append(v)
+            if not grupo & nucleo_nodos:
+                ocultos |= grupo
+        for n in ocultos:
+            mapa.pop(n, None)
+        for d in mapa.values():
+            for n in ocultos & set(d.get("peers", {})):
+                d["peers"].pop(n)
+    if cortados or escondidos:
+        print(f"Puertos bloqueados: {len(cortados)} enlaces quitados; equipos ocultos: {len(escondidos)} "
+              f"elegidos y {len(ocultos)} que solo colgaban de ellos o de un puerto bloqueado")
+
+    # Sin vecinos automaticos el mapa muestra solo los hosts elegidos: fuera los vecinos LLDP/CDP sin datos (grises)
+    if not a.auto_vecinos:
+        for d in mapa.values():
+            for p in [p for p in d.get("peers", {}) if p not in mapa]:
+                d["peers"].pop(p)
+
+    # Enlaces por PPP (PPPoE, L2TP, PPTP, SSTP, OVPN): no son cable; se quitan del mapa
+    PPP = re.compile(r"^<?(pppoe|ppp|l2tp|pptp|sstp|ovpn|openvpn)", re.I)
+    es_ppp = lambda cn: any(PPP.match(miembro(x)) or PPP.match((x or "").strip()) for x in cn[:2])
+    sin_ppp = set()
+    # hosts con "Bloqueo PPP: NO": sus conexiones PPP se conservan (se ven como tunel, entrecortadas)
+    ppp_libre = {n_ for n_, d in mapa.items()
+                 if CFG_HOST.get((d.get("node_details") or {}).get("ip"), {}).get("bloqueo_ppp", True) is False}
+    for n_, d in mapa.items():
+        for vec in list(d.get("peers", {})):
+            p = d["peers"][vec]
+            if p.get("manual") or n_ in ppp_libre or vec in ppp_libre:
+                continue
+            conns = p.get("connections", [])
+            quedan = [cn for cn in conns if not (cn and es_ppp(cn))]
+            if len(quedan) != len(conns):
+                sin_ppp.add(tuple(sorted((n_, vec))))
+                if quedan:
+                    p["connections"] = quedan
+                else:
+                    d["peers"].pop(vec)
+    if sin_ppp:
+        print(f"Enlaces por PPP quitados: {len(sin_ppp)}")
+    # Filtro del mapa: los equipos que solo se conectaban por PPP/VPN (clientes PPPoE, tuneles L2TP/PPTP...)
+    # se quitan, y tambien lo que solo colgaba de ellos. Los hosts cargados y el nucleo se quedan.
+    if OCULTAR.get("ppp", True) and sin_ppp:
+        fijos = {n_ for n_, d in mapa.items() if ((d.get("node_details") or {}).get("metadata") or {}).get("fijo")}
+        quitar_ppp, cand = set(), {n_ for k in sin_ppp for n_ in k}
+        while cand:
+            nuevos = set()
+            for n_ in cand:
+                if n_ in quitar_ppp or n_ in fijos or n_ not in mapa:
+                    continue
+                vec = set(mapa[n_].get("peers", {})) | {o for o, d in mapa.items() if n_ in d.get("peers", {})}
+                if not (vec - quitar_ppp - {n_}):
+                    quitar_ppp.add(n_)
+                    nuevos |= vec
+            cand = nuevos - quitar_ppp
+        for n_ in quitar_ppp:
+            mapa.pop(n_, None)
+        for d in mapa.values():
+            for n_ in quitar_ppp & set(d.get("peers", {})):
+                d["peers"].pop(n_)
+        if quitar_ppp:
+            print(f"Equipos por PPP/VPN ocultos: {len(quitar_ppp)}")
+
+    # un equipo no se enlaza consigo mismo (pasa cuando el recorrido ve su propia MAC por otro puerto)
+    for n_, d in mapa.items():
+        d.get("peers", {}).pop(n_, None)
+    # Enlaces que no son cable directo: se marcan "indirecto" (el visor los muestra solo al buscar una VLAN)
+    nodos_nucleo = {nodo_de_ip[h] for h in nucleo if nodo_de_ip.get(h) in mapa}
+    indirectos = separar_indirectos(mapa, nodos_nucleo)
+    for (x, y), motivo in indirectos.items():
+        for a_, b_ in ((x, y), (y, x)):
+            p = mapa.get(a_, {}).get("peers", {}).get(b_)
+            if p is not None:
+                p["indirecto"] = motivo
+    if indirectos:
+        print(f"Enlaces indirectos (por VLAN, tunel o a traves de otro switch): {len(indirectos)}")
+
+    # VLANs. Nombres desde las interfaces vlan del nucleo ("vlan200-[MGMT]" -> 200 = MGMT)
+    vlan_nombres = {}
+    for host in nucleo:
+        for x in (ifnames.get(host) or {}).values():
+            m = re.match(r"vlan[-_ ]?(\d{1,4})(?:[-_ .]+(.+))?$", x or "", re.I)
+            if m and 0 < int(m.group(1)) < 4095 and m.group(2):
+                vlan_nombres.setdefault(str(int(m.group(1))), re.sub(r"^\[(.*)\]$", r"\1", m.group(2).strip()))
+    con_vlan = 0
+    tablas_vlan = {}        # nodo -> (host, VLANs por puerto, PVID por puerto)
+
+    # Memoria de VLANs por puerto: la tabla Bridge > Hosts solo muestra VLANs con trafico en ese momento.
+    # Se suman las VLANs vistas en el mismo puerto en las ultimas 2 horas (si no, una VLAN sin trafico "desaparece").
+    # Es corto a proposito: una VLAN quitada de un puerto deja de verse sola en ese tiempo (por SNMP RouterOS no
+    # informa las VLANs configuradas en el bridge, asi que "quitada" y "sin trafico" solo se distinguen por tiempo).
+    SEG_MEMORIA, ahora = 2 * 3600, time.time()
+    memoria, ruta_mem = {}, Path(a.memoria_vlan) if a.memoria_vlan else None
+    if ruta_mem and ruta_mem.exists():
+        try:
+            memoria = json.loads(ruta_mem.read_text(encoding="utf-8"))
+        except ValueError:
+            memoria = {}
+    elif ruta_mem and a.historial and Path(a.historial).is_dir():
+        import gzip
+        for hf in sorted(Path(a.historial).glob("*.json.gz")):
+            try:
+                ts = time.mktime(time.strptime(hf.name[:15], "%Y%m%d-%H%M%S"))
+                if ahora - ts > SEG_MEMORIA:
+                    continue
+                viejo = json.loads(gzip.open(hf).read().decode("utf-8"))
+            except (ValueError, OSError):
+                continue
+            for d in viejo.values():
+                nd = d.get("node_details") or {}
+                if nd.get("ip") not in nucleo:
+                    continue
+                for fila in (nd.get("metadata") or {}).get("vlans_puertos") or []:
+                    if fila.get("por_interfaz"):
+                        continue
+                    for vid in [x for x in (fila.get("vlans") or "").split(", ") if x.isdigit()]:
+                        mp = memoria.setdefault(nd["ip"], {}).setdefault(fila["puerto"], {})
+                        mp[vid] = max(mp.get(vid, 0), ts)
+    # VLANs del bridge por la API de RouterOS (hosts con "Leer VLANs por API"): tagged / untagged configuradas,
+    # con o sin trafico. Reemplazan a las de la tabla Bridge > Hosts; si la API falla, se sigue con SNMP.
+    api_ok, api_err, macs_fdb = set(), [], {}
+    def ids_vlan(txt):
+        res = set()
+        for parte in (txt or "").split(","):
+            parte = parte.strip()
+            a_, _, b_ = parte.partition("-")
+            if a_.isdigit() and (not b_ or b_.isdigit()):
+                ini, fin = int(a_), int(b_ or a_)
+                if 0 < ini <= fin < 4095 and fin - ini < 4094:
+                    res |= {str(x) for x in range(ini, fin + 1)}
+        return res
+    for host in nucleo:
+        if not (API_ROS and CFG_HOST.get(host, {}).get("api_vlans")) or host in MUERTOS:
+            continue
+        try:
+            vl, puertos_br, bridges = api_ros(host, API_ROS["usuario"], API_ROS["password"], [
+                ["/interface/bridge/vlan/print", "=.proplist=bridge,vlan-ids,current-tagged,current-untagged,tagged,untagged,disabled"],
+                ["/interface/bridge/port/print", "=.proplist=interface,pvid,disabled"],
+                ["/interface/bridge/print", "=.proplist=name"]])
+        except Exception as e:
+            api_err.append(f"{host} ({str(e)[:60]})")
+            continue
+        nombres_br = {b.get("name") for b in bridges}
+        vp_api, pv_api = {}, {}
+        for fila in vl:
+            if fila.get("disabled") == "true":
+                continue
+            vids = ids_vlan(fila.get("vlan-ids"))
+            for campo in ("current-tagged", "current-untagged", "tagged", "untagged"):
+                for x in (fila.get(campo) or "").split(","):
+                    x = x.strip()
+                    if x:
+                        cnt = vp_api.setdefault("bridge" if x in nombres_br else x, {})
+                        for vid in vids:
+                            cnt[vid] = max(cnt.get(vid, 0), 1)
+        for fila in puertos_br:
+            if fila.get("disabled") != "true" and fila.get("interface") and str(fila.get("pvid", "")).isdigit():
+                pv_api[fila["interface"]] = str(int(fila["pvid"]))
+        macs_fdb[host] = {p: sum(v.values()) for p, v in vlans_puerto.get(host, {}).items()}
+        vlans_puerto[host], pvid_puerto[host] = vp_api, pv_api
+        api_ok.add(host)
+    if api_ok or api_err:
+        print(f"VLANs por API RouterOS: {len(api_ok)} equipos leidos" + (f"; sin acceso (se usa SNMP): {', '.join(api_err)}" if api_err else ""))
+
+    vlans_memoria = {}      # host -> {puerto: VLANs que hoy no se ven pero si en las ultimas horas}
+    for host in nucleo:
+        if host in MUERTOS or host not in vlans_puerto or host in api_ok:
+            continue
+        vp, mh = vlans_puerto[host], memoria.setdefault(host, {})
+        for puerto, vids in vp.items():
+            for vid, n in vids.items():
+                if n:
+                    mh.setdefault(puerto, {})[vid] = ahora
+        for puerto, vids in mh.items():
+            for vid, ts in list(vids.items()):
+                if ahora - ts > SEG_MEMORIA:
+                    vids.pop(vid)
+                elif vid not in vp.get(puerto, {}):
+                    vp.setdefault(puerto, {})[vid] = 0       # 0 MACs ahora: visto en los ultimos dias
+                    vlans_memoria.setdefault(host, {}).setdefault(puerto, set()).add(vid)
+    if ruta_mem:
+        try:
+            ruta_mem.parent.mkdir(parents=True, exist_ok=True)
+            tmp_mem = ruta_mem.with_suffix(".tmp")
+            tmp_mem.write_text(json.dumps({h: {p: v for p, v in ps.items() if v} for h, ps in memoria.items()}),
+                               encoding="utf-8")
+            tmp_mem.replace(ruta_mem)
+        except OSError as e:
+            print(f"No se pudo guardar la memoria de VLANs: {e}")
+    if vlans_memoria:
+        print(f"VLANs sin trafico ahora pero vistas en las ultimas {SEG_MEMORIA // 3600} horas: "
+              f"{sum(len(v) for ps in vlans_memoria.values() for v in ps.values())} (puerto, VLAN) en {len(vlans_memoria)} equipos")
+
+    # VLANs por interfaz VLAN sobre un puerto que no esta en el bridge: "vlan100-ether9" = VLAN 100 en ether9,
+    # "Vl10-sfp28-3[S001]" = VLAN 10 en sfp28-3 (SNMP de RouterOS no informa el puerto padre: se toma del nombre)
+    vlans_interfaz = {}     # host -> {puerto: VLANs}
+    for host in nucleo:
+        nombres = {x for x in (ifnames.get(host) or {}).values() if x}
+        for x in nombres:
+            m_vi = re.match(r"(?:vlan|vl)[-_ ]?(\d{1,4})[-_ ]+(.+?)\s*$", x, re.I)
+            if not m_vi or not 0 < int(m_vi.group(1)) < 4095:
+                continue
+            padre = re.sub(r"\s*\[[^\]]*\]$", "", m_vi.group(2)).strip()
+            if padre in nombres and padre != x:
+                vlans_interfaz.setdefault(host, {}).setdefault(padre, set()).add(str(int(m_vi.group(1))))
+
+    for host in nucleo:
+        nodo = nodo_de_ip.get(host)
+        vp, pv = vlans_puerto.get(host, {}), pvid_puerto.get(host, {})
+        if not nodo or nodo not in mapa or not (vp or pv or vlans_interfaz.get(host)):
+            continue
+        numerico = lambda s: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+        md = mapa[nodo]["node_details"].setdefault("metadata", {})
+        md["vlans_puertos"] = [{"puerto": p, "pvid": pv.get(p, ""), "vlans": ", ".join(sorted(vp.get(p, {}), key=int)),
+                                "macs": macs_fdb[host].get(p, 0) if host in api_ok else sum(vp.get(p, {}).values()),
+                                "vistas_antes": ", ".join(sorted(vlans_memoria.get(host, {}).get(p, ()), key=int))}
+                               for p in sorted(set(vp) | set(pv), key=numerico)]
+        md["vlans_puertos"] += [{"puerto": p, "pvid": "", "vlans": ", ".join(sorted(v, key=int)), "macs": 0,
+                                 "por_interfaz": True}
+                                for p, v in sorted(vlans_interfaz.get(host, {}).items(), key=lambda x: numerico(x[0]))]
+        md["vlans_locales"] = sorted(vp.get("bridge", {}), key=int)   # VLANs que llegan al propio equipo
+        md["vlans_fuente"] = "API RouterOS (configuradas en el bridge)" if host in api_ok else "SNMP (tráfico visto)"
+        if vlan_nombres:
+            md["vlan_nombres"] = vlan_nombres
+        tablas_vlan[nodo] = (host, vp, pv)
+
+    # VLANs de cada enlace: lo que ve el puerto de CADA extremo del cable (tabla Bridge > Hosts y PVID),
+    # sin importar cual de los dos equipos informo el enlace. Antes solo se miraba el equipo que lo informaba
+    # y se perdian VLANs (p. ej. la 11 de RB ZONA 1 hacia SW-SFP-002).
+    def vlans_de_puerto(nodo, puerto, solo_nombre=False):
+        if nodo not in tablas_vlan or not puerto:
+            return set(), ""
+        host, vp, pv = tablas_vlan[nodo]
+        tot, nativa = set(), ""
+        if solo_nombre:      # solo la VLAN que dice el nombre de la interfaz ("Vl400", "vlan200-...")
+            m_vl = re.match(r"(?:vlan|vl)[-_ ]?(\d{1,4})", miembro(puerto), re.I)
+            return ({str(int(m_vl.group(1)))} if m_vl and 0 < int(m_vl.group(1)) < 4095 else set()), ""
+        for padre, vids in vlans_interfaz.get(host, {}).items():   # interfaces VLAN sobre ese puerto
+            if coincide(puerto, equivalentes.get(host, {}).get(norm(padre), {norm(padre)})):
+                tot |= vids
+        m_vl = re.match(r"(?:vlan|vl)[-_ ]?(\d{1,4})", miembro(puerto), re.I)
+        if m_vl and 0 < int(m_vl.group(1)) < 4095:
+            tot.add(str(int(m_vl.group(1))))          # visto por una interfaz VLAN
+        for pn in set(vp) | set(pv):
+            if pn != "bridge" and coincide(puerto, equivalentes.get(host, {}).get(norm(pn), {norm(pn)})):
+                tot |= set(vp.get(pn, {}))
+                if pv.get(pn):
+                    tot.add(pv[pn])
+                    nativa = nativa or pv[pn]
+        return tot, nativa
+
+    for n_, d in mapa.items():
+        for vec, p in d.get("peers", {}).items():
+            tot, nativa = set(), ""
+            # enlace "a traves de otro equipo": el puerto ya tiene un cable directo con otro equipo, asi que sus
+            # VLANs son las de todo lo que hay detras, no las de este equipo. No se le asignan (si no, el equipo
+            # parece tener VLANs que no se sabe si tiene y se confunde con los conectados por cable).
+            atras = any(str(x.get("indirecto") or "").startswith("a través")
+                        for x in (p, mapa.get(vec, {}).get("peers", {}).get(n_) or {}))
+            for cn in p.get("connections", []):
+                if not cn:
+                    continue
+                t1, n1 = vlans_de_puerto(n_, cn[0], atras)                          # este extremo
+                t2, n2 = vlans_de_puerto(vec, cn[1] if len(cn) > 1 else "", atras)  # el otro extremo
+                tot |= t1 | t2
+                nativa = nativa or n1 or n2
+            if tot:
+                p["vlans"] = sorted(tot, key=int)
+                con_vlan += 1
+            if nativa:
+                p["vlan_nativa"] = nativa
+    if con_vlan:
+        print(f"VLANs: {con_vlan} enlaces con VLAN; nombres: "
+              + (", ".join(f"{k}={v}" for k, v in sorted(vlan_nombres.items(), key=lambda x: int(x[0]))) or "-"))
+
+    # RSTP de cada router/switch (BRIDGE-MIB por SNMP): prioridad, bridge ID y root.
+    # RouterOS no informa por SNMP el protocolo ni el "port cost mode": se deducen de la tabla de puertos STP
+    # (long: 2000 = 10G, 20000 = 1G, 200000 = 100M...; un costo 10 aparece en los dos modos y no dice nada)
+    def id_puente(txt):
+        b = [x for x in re.split(r"[\s:]+", (txt or "").strip()) if re.fullmatch(r"[0-9a-fA-F]{2}", x)]
+        return "".join(b).lower() if len(b) == 8 and int("".join(b[2:]), 16) else ""
+    stp = {}
+    for host in nucleo:
+        nodo = nodo_de_ip.get(host)
+        if not nodo or nodo not in mapa or host in MUERTOS:
+            continue
+        tb = walk(host, comm(host), ".1.3.6.1.2.1.17.2")
+        prio = tb.get("2.0", "")
+        if not prio.isdigit():
+            continue
+        mac_b = mac_de(walk(host, comm(host), ".1.3.6.1.2.1.17.1.1").get("0", ""))
+        col = lambda c: {k.split(".")[3]: v for k, v in tb.items() if k.startswith(f"15.1.{c}.") and len(k.split(".")) == 4}
+        estados, costos = col(3), col(5)
+        cs = {int(v) for v in costos.values() if v.isdigit() and int(v) > 0}
+        cuenta = {}
+        for v in col(6).values():            # root que se ve en cada puerto (cuando el equipo no da el suyo)
+            i = id_puente(v)
+            if i:
+                cuenta[i] = cuenta.get(i, 0) + 1
+        root = id_puente(tb.get("5.0")) or (max(cuenta, key=cuenta.get) if cuenta else "")
+        bp2if = walk(host, comm(host), ".1.3.6.1.2.1.17.1.4.1.2")
+        rp = tb.get("7.0", "")
+        stp[nodo] = {"prioridad": f"{int(prio):04X}", "id": f"{int(prio):04x}{mac_b}" if mac_b else "",
+                     "modo": "RSTP" if estados else "",
+                     # por SNMP llega el path-cost configurado (10 por defecto en los dos modos): solo costos de
+                     # 200 o mas (2000 = 10G, 20000 = 1G) prueban "long"; si no, no se puede saber
+                     "costo": "long" if any(c >= 200 for c in cs) else "",
+                     "root_id": root, "costo_root": tb.get("6.0", ""),
+                     "puerto_root": (ifnames.get(host) or {}).get(bp2if.get(rp, ""), "") if rp not in ("", "0") else ""}
+    seguidores = {}
+    for nodo, s in stp.items():
+        if s["root_id"] and s["root_id"] != s["id"]:
+            seguidores[s["root_id"]] = seguidores.get(s["root_id"], 0) + 1
+    nombre_de_id = {s["id"]: n for n, s in stp.items() if s["id"]}
+    raices = []
+    for nodo, s in stp.items():
+        s["seguidores"] = seguidores.get(s["id"], 0) if s["id"] else 0
+        # root: su bridge ID es el root que informa el mismo equipo o los demas equipos del mapa
+        s["root"] = bool(s["id"]) and (s["seguidores"] > 0 or s["root_id"] == s["id"])
+        s["root_nombre"] = nombre_de_id.get(s["root_id"], "")
+        if s["root"]:
+            raices.append(f"{nodo} ({s['seguidores']} equipos)")
+        mapa[nodo]["node_details"].setdefault("metadata", {})["stp"] = s
+    if stp:
+        print(f"RSTP: {len(stp)} equipos con STP; root: {', '.join(raices) or 'ninguno dentro del mapa'}")
+
+    salida = Path(a.output or a.mapa)
+    salida.write_text(json.dumps(mapa, indent=1, ensure_ascii=False), encoding="utf-8")
+    print(f"Quitados (duplicados): {sorted(quitar)}")
+    for fila in resumen:
+        print(" | ".join(fila))
+    if auto:
+        print(f"Agregados automaticamente ({len(auto)}):")
+        for fila in auto:
+            print("  + " + " | ".join(fila))
+    if sin_ip:
+        print(f"Vecinos sin IP en el ARP ({len(sin_ip)}):")
+        for fila in sin_ip:
+            print("  ? " + " | ".join(fila))
+    print(f"Mapa guardado: {salida}")
+
+
+if __name__ == "__main__":
+    main()

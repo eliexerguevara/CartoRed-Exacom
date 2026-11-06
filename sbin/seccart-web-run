@@ -1,0 +1,501 @@
+#!/opt/seccart2/bin/python
+"""Procesa las solicitudes de la pagina web de administracion de mapas (corre como root via systemd).
+
+La web (www-data) solo escribe:
+  /var/lib/seccart-web/mapas/<mapa>.json   configuracion de equipos de cada mapa
+  /var/lib/seccart-web/cola/*.json         solicitudes: {"accion": "actualizar", "mapa": "red"}
+                                                        {"accion": "comunidad", "nombre": "...", "community": "..."}
+Este proceso valida todo (lo que escribe la web se trata como no confiable), agrega comunidades al
+almacen, recorre la red, anexa los equipos de acceso y publica. Deja el estado en estado/<mapa>.json.
+"""
+import fcntl
+import gzip
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE = Path('/var/lib/seccart-web')
+COLA, MAPAS, ESTADO = BASE / 'cola', BASE / 'mapas', BASE / 'estado'
+MAPAS_ROOT = Path('/root/mapas')
+VAULT_PASS = Path('/root/.seccart2/vault.pass')
+NOMBRE_MAPA = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
+NOMBRE_EQUIPO = re.compile(r'^[A-Za-z0-9 ._()\-]{1,60}$')
+NOMBRE_CRED = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
+COMMUNITY = re.compile(r'^[\x21-\x7e]{1,64}$')   # ASCII imprimible sin espacios
+API_CRED = 'routeros-api'                         # usuario de la API de RouterOS (solo lectura) en el almacen
+API_USUARIO = re.compile(r'^[A-Za-z0-9._@-]{1,40}$')
+API_CLAVE = re.compile(r'^[\x20-\x7e]{1,128}$')
+PUERTO_IF = re.compile(r'^[\x20-\x7e]{1,64}$')   # nombre de interfaz (puede tener espacios)
+
+
+def abrir_vault():
+    from sc2.scng.creds.vault import CredentialVault
+    v = CredentialVault()
+    v.unlock(VAULT_PASS.read_text().strip())
+    return v
+
+
+def comunidades(v):
+    """Devuelve [(nombre, community)] de las credenciales SNMPv2c, por prioridad."""
+    infos = sorted(v.list_credentials(), key=lambda c: getattr(c, 'priority', 100) or 100)
+    res = []
+    for c in infos:
+        if 'v2c' in str(getattr(c, 'credential_type', '')).lower():
+            cred = v.get_snmpv2c_credential(name=c.name)
+            if cred and cred.community:
+                res.append((c.name, cred.community))
+    return res
+
+
+def publicar_lista_comunidades(v):
+    """La web solo ve los nombres, nunca las comunidades."""
+    nombres = [n for n, _ in comunidades(v)]
+    (BASE / 'comunidades.json').write_text(json.dumps(nombres))
+    os.chmod(BASE / 'comunidades.json', 0o644)
+
+
+def ip_valida(ip):
+    try:
+        ipaddress.IPv4Address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+TIPOS = ('router', 'switch', 'acceso', 'otro', 'olt')
+PUBLICADOS = Path('/var/www/html/mapa/data')
+HISTORIAL = BASE / 'historial'      # <mapa>/<AAAAMMDD-HHMMSS>.json.gz + indice.json (7 dias)
+DIAS_HISTORIAL = 7
+
+
+def para_web_lectura(f, modo):
+    shutil.chown(f, 'root', 'www-data')
+    os.chmod(f, modo)
+
+
+def guardar_historial(mapa):
+    """Copia comprimida del mapa publicado; borra lo que tenga mas de DIAS_HISTORIAL dias."""
+    pub = PUBLICADOS / f'{mapa}.json'
+    if not pub.exists():
+        return
+    crudo = pub.read_bytes()
+    datos = json.loads(crudo)
+    enlaces = set()
+    for a, d in datos.items():
+        for b in (d.get('peers') or {}):
+            enlaces.add(tuple(sorted((a, b))))
+    carpeta = HISTORIAL / mapa
+    for x in (HISTORIAL, carpeta):
+        x.mkdir(exist_ok=True)
+        para_web_lectura(x, 0o750)
+    ahora = time.time()
+    ident = time.strftime('%Y%m%d-%H%M%S', time.localtime(ahora))
+    tmp = carpeta / f'{ident}.gz.tmp'
+    with gzip.open(tmp, 'wb', compresslevel=6) as g:
+        g.write(crudo)
+    para_web_lectura(tmp, 0o640)
+    tmp.replace(carpeta / f'{ident}.json.gz')
+    f_ind = carpeta / 'indice.json'
+    try:
+        indice = json.loads(f_ind.read_text(encoding='utf-8'))
+    except Exception:
+        indice = []
+    indice = [x for x in indice if isinstance(x, dict) and x.get('id') != ident]
+    indice.append({'id': ident, 'fecha': time.strftime('%Y-%m-%d %H:%M', time.localtime(ahora)),
+                   'equipos': len(datos), 'enlaces': len(enlaces)})
+    limite = time.strftime('%Y%m%d-%H%M%S', time.localtime(ahora - DIAS_HISTORIAL * 86400))
+    indice = sorted((x for x in indice if str(x.get('id', '')) >= limite and (carpeta / f"{x['id']}.json.gz").exists()),
+                    key=lambda x: x['id'])
+    quedan = {f"{x['id']}.json.gz" for x in indice}
+    for f in carpeta.glob('*.json.gz'):
+        if f.name not in quedan:
+            f.unlink(missing_ok=True)
+    tmp = carpeta / 'indice.tmp'
+    tmp.write_text(json.dumps(indice, ensure_ascii=False), encoding='utf-8')
+    para_web_lectura(tmp, 0o640)
+    tmp.replace(f_ind)
+
+
+def migrar(mapa, v):
+    """Formato anterior (nucleo/acceso con nombre de credencial) -> lista "hosts" con su interfaz SNMP.
+    La community de cada host sale de su credencial o, si no tenia, de la que respondio en el ultimo mapa."""
+    f = MAPAS / f'{mapa}.json'
+    cfg = json.loads(f.read_text(encoding='utf-8'))
+    if 'hosts' in cfg or ('nucleo' not in cfg and 'acceso' not in cfg):
+        return
+    por_nombre = dict(comunidades(v))
+    respondio = {}
+    pub = PUBLICADOS / f'{mapa}.json'
+    if pub.exists():
+        try:
+            for d in json.loads(pub.read_text(encoding='utf-8')).values():
+                nd = d.get('node_details') or {}
+                c = ((nd.get('metadata') or {}).get('snmp') or {}).get('community')
+                if nd.get('ip') and c:
+                    respondio[nd['ip']] = c
+        except Exception:
+            pass
+    hosts = []
+    for e in cfg.get('nucleo', []) + [dict(x, tipo='acceso') for x in cfg.get('acceso', [])]:
+        hosts.append({'nombre': e.get('nombre', ''), 'tipo': e.get('tipo', 'acceso'), 'ip': e.get('ip', ''),
+                      'puerto': 161, 'version': 'v2c',
+                      'community': por_nombre.get(e.get('credencial')) or respondio.get(e.get('ip'), '')})
+    cfg['hosts'] = hosts
+    cfg.pop('nucleo', None)
+    cfg.pop('acceso', None)
+    st = f.stat()
+    tmp = f.with_suffix('.migrando')
+    tmp.write_text(json.dumps(cfg, indent=4, ensure_ascii=False), encoding='utf-8')
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.chmod(tmp, 0o660)
+    tmp.replace(f)
+
+
+INVENTARIO = BASE / 'inventario' / 'hosts.json'
+ENLACES = BASE / 'inventario' / 'enlaces.json'   # enlaces manuales entre equipos (pagina Hosts)
+
+
+def escribir_para_web(f, datos):
+    """JSON que la web (www-data) debe poder leer y modificar."""
+    tmp = f.with_suffix('.migrando')
+    tmp.write_text(json.dumps(datos, indent=4, ensure_ascii=False), encoding='utf-8')
+    shutil.chown(tmp, 'www-data', 'www-data')
+    os.chmod(tmp, 0o660)
+    tmp.replace(f)
+
+
+def migrar_inventario():
+    """Listas de hosts por mapa -> una lista unica (inventario/hosts.json); cada host con los mapas donde aparece."""
+    if INVENTARIO.exists():
+        return
+    hosts, por_ip, archivos = [], {}, []
+    for f in sorted(MAPAS.glob('*.json')):
+        if not NOMBRE_MAPA.match(f.stem):
+            continue
+        cfg = json.loads(f.read_text(encoding='utf-8'))
+        archivos.append((f, cfg))
+        for h in cfg.get('hosts', []):
+            ip = h.get('ip')
+            visible = h.get('visible', True) is not False
+            if ip in por_ip:
+                if visible and f.stem not in por_ip[ip]['mapas']:
+                    por_ip[ip]['mapas'].append(f.stem)
+                continue
+            nuevo = {k: v for k, v in h.items() if k != 'visible'}
+            nuevo['mapas'] = [f.stem] if visible else []
+            por_ip[ip] = nuevo
+            hosts.append(nuevo)
+    INVENTARIO.parent.mkdir(exist_ok=True)
+    shutil.chown(INVENTARIO.parent, 'root', 'www-data')
+    os.chmod(INVENTARIO.parent, 0o2770)
+    escribir_para_web(INVENTARIO, {'hosts': hosts})
+    for f, cfg in archivos:
+        if 'hosts' in cfg:
+            cfg.pop('hosts')
+            escribir_para_web(f, cfg)
+
+
+def leer_config(mapa):
+    """Hosts validados: nombre, tipo, ip, puerto, version (v1|v2c) y community (vacia = probar todas)."""
+    cfg = json.loads((MAPAS / f'{mapa}.json').read_text(encoding='utf-8'))
+    inventario = json.loads(INVENTARIO.read_text(encoding='utf-8')).get('hosts', []) if INVENTARIO.exists() else []
+    hosts = []
+    for h in inventario:
+        if mapa not in (h.get('mapas') or []):
+            continue
+        if not (NOMBRE_EQUIPO.match(str(h.get('nombre', ''))) and ip_valida(str(h.get('ip', '')))):
+            continue
+        puerto = h.get('puerto', 161)
+        comm = str(h.get('community') or '')
+        hosts.append({'nombre': h['nombre'], 'ip': h['ip'],
+                      'tipo': h.get('tipo') if h.get('tipo') in TIPOS else 'acceso',
+                      'puerto': puerto if isinstance(puerto, int) and 1 <= puerto <= 65535 else 161,
+                      'version': 'v1' if h.get('version') == 'v1' else 'v2c',
+                      'community': comm if COMMUNITY.match(comm) else '',
+                      'bloqueados': [p for p in h.get('bloqueados', []) if isinstance(p, str) and PUERTO_IF.match(p)][:300],
+                      # OLT: siempre con enlaces manuales (no se deducen por tabla de MAC ni LLDP)
+                      'solo_manuales': h.get('solo_manuales') is True or h.get('tipo') == 'olt',
+                      # "solo dibujar": nunca se le consulta nada (ni SNMP ni ping); no aplica a router/switch
+                      'sin_escaneo': h.get('sin_escaneo') is True and h.get('tipo') not in ('router', 'switch'),
+                      'bloqueo_ppp': h.get('bloqueo_ppp') is not False,
+                      # VLANs del bridge por la API de RouterOS (solo router/switch; apagado por defecto)
+                      'api_vlans': h.get('api_vlans') is True and h.get('tipo') in ('router', 'switch')})
+    prof = cfg.get('profundidad', 0)
+    prof = prof if isinstance(prof, int) and 0 <= prof <= 3 else 0
+    auto = cfg.get('auto_vecinos', True) is not False
+    barrido = cfg.get('barrido', True) is not False
+    if not any(h['tipo'] in ('router', 'switch') for h in hosts):
+        raise ValueError('El mapa no tiene ningún host de tipo Router o Switch (elige este mapa en el menú "Mapas" de algún host)')
+    # equipos descubiertos que se ocultaron en este mapa
+    ocultar = {'ips': [], 'macs': [], 'ppp': cfg.get('ocultar_ppp', True) is not False}
+    for o in cfg.get('ocultos', []):
+        if isinstance(o, dict):
+            if ip_valida(str(o.get('ip', ''))):
+                ocultar['ips'].append(o['ip'])
+            elif re.fullmatch(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', str(o.get('mac', ''))):
+                ocultar['macs'].append(o['mac'].lower())
+    return hosts, prof, auto, barrido, ocultar
+
+
+def leer_enlaces():
+    """Enlaces manuales validados: [{a, pa, b, pb}] (IP y puerto de cada extremo; el puerto puede ir vacio)."""
+    try:
+        datos = json.loads(ENLACES.read_text(encoding='utf-8')).get('enlaces', []) if ENLACES.exists() else []
+    except ValueError:
+        return []
+    res = []
+    for e in datos if isinstance(datos, list) else []:
+        if not isinstance(e, dict):
+            continue
+        a, b = str(e.get('a', '')), str(e.get('b', ''))
+        pa, pb = str(e.get('pa', '') or ''), str(e.get('pb', '') or '')
+        if ip_valida(a) and ip_valida(b) and a != b and all(p == '' or PUERTO_IF.match(p) for p in (pa, pb)):
+            res.append({'a': a, 'pa': pa, 'b': b, 'pb': pb,
+                        'rol': 'respaldo' if e.get('rol') == 'respaldo' else 'principal'})
+    return res[:2000]
+
+
+def asegurar_en_vault(v, hosts):
+    """El recorrido de SecureCartography2 prueba las comunidades del almacen cifrado: se agregan las de los hosts."""
+    existentes = {c for _, c in comunidades(v)}
+    nombres = {c.name for c in v.list_credentials()}
+    for h in hosts:
+        c = h['community']
+        if not c or h['version'] != 'v2c' or c in existentes:
+            continue
+        base = 'host-' + re.sub(r'[^A-Za-z0-9_-]', '-', h['nombre'])[:34]
+        nombre, i = base, 2
+        while nombre in nombres:
+            nombre, i = f'{base}-{i}', i + 1
+        v.add_snmpv2c_credential(name=nombre, community=c, description='Community de un host (pagina Hosts)',
+                                 priority=100 + len(nombres))
+        nombres.add(nombre)
+        existentes.add(c)
+
+
+def guardar_estado(mapa, **kw):
+    ESTADO.mkdir(parents=True, exist_ok=True)
+    f = ESTADO / f'{mapa}.json'
+    previo = json.loads(f.read_text()) if f.exists() else {}
+    previo.update(kw)
+    tmp = f.with_suffix('.tmp')
+    tmp.write_text(json.dumps(previo, ensure_ascii=False))
+    os.chmod(tmp, 0o644)
+    tmp.replace(f)
+
+
+def correr(cmd, log, timeout=1800):
+    log.append('$ ' + ' '.join(c if not c.startswith('--community=') else '--community=***' for c in cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd='/root')
+    salida = (r.stdout + r.stderr).strip().splitlines()
+    log.extend(l for l in salida if 'Warning' not in l)
+    if r.returncode != 0:
+        raise RuntimeError(f'{cmd[0]} terminó con código {r.returncode}')
+    return salida
+
+
+def actualizar(mapa, v):
+    hosts, prof, auto, barrido, ocultar = leer_config(mapa)
+    asegurar_en_vault(v, hosts)
+    publicar_lista_comunidades(v)
+    nucleo = [h for h in hosts if h['tipo'] in ('router', 'switch')]
+    acceso = [h for h in hosts if h['tipo'] not in ('router', 'switch')]
+    comms = comunidades(v)
+    if not comms:
+        raise ValueError('No hay comunidades SNMP cargadas')
+    routers = [e['ip'] for e in nucleo if e['tipo'] == 'router']
+    switches = [e['ip'] for e in nucleo if e['tipo'] == 'switch']
+    log = []
+    guardar_estado(mapa, estado='ejecutando', inicio=time.strftime('%Y-%m-%d %H:%M:%S'), fin='', log=[], resumen='')
+    destino, tmp = MAPAS_ROOT / mapa, MAPAS_ROOT / f'{mapa}.nuevo'
+    subprocess.run(['rm', '-rf', str(tmp)])
+    try:
+        # el recorrido de SecureCartography2 usa SNMP v2c en el puerto 161; el resto lo consulta seccart2-anexar
+        ips = list(dict.fromkeys(h['ip'] for h in nucleo + acceso
+                                 if h['version'] == 'v2c' and h['puerto'] == 161 and not h['sin_escaneo']
+                                 and h['tipo'] != 'olt'))   # la OLT no entra al recorrido completo: solo se leen sus uplinks
+        salida = correr(['/usr/local/bin/seccart2-crawl', 'crawl', *ips, '-d', str(prof), '--no-dns', '-t', '10',
+                         '--no-color', '-o', str(tmp)], log)
+        ok = sum(1 for l in salida if l.strip().startswith('OK:'))
+        if not (tmp / 'map.json').exists():
+            raise RuntimeError('El recorrido no generó map.json')
+        (tmp / 'map.crawl.json').write_bytes((tmp / 'map.json').read_bytes())
+        if nucleo:   # siempre: aplica tipos, puertos bloqueados, ocultos y (si hay routers) ARP
+            lista = tmp / 'acceso.csv'
+            lista.write_text(''.join(f"{e['nombre']}\t{e['ip']}\n" for e in acceso), encoding='utf-8')
+            # comunidades e interfaz SNMP de cada host: en archivo de root, no en la linea de comandos
+            creds = tmp / 'credenciales.json'
+            creds.touch(mode=0o600)
+            creds.write_text(json.dumps({
+                'comunidades': [{'nombre': n, 'community': c} for n, c in comms],
+                'hosts': {h['ip']: {'version': h['version'], 'puerto': h['puerto'], 'community': h['community'],
+                                    'tipo': h['tipo'], 'bloqueados': h['bloqueados'],
+                                    'solo_manuales': h['solo_manuales'], 'sin_escaneo': h['sin_escaneo'],
+                                    'bloqueo_ppp': h['bloqueo_ppp'], 'api_vlans': h['api_vlans']} for h in hosts},
+                'api': credencial_api(v) if any(h['api_vlans'] for h in hosts) else None,
+                'ocultar': ocultar,
+                'enlaces': leer_enlaces(),
+            }), encoding='utf-8')
+            cmd = ['/usr/local/bin/seccart2-anexar', str(tmp / 'map.crawl.json'), str(lista), '-o', str(tmp / 'map.json'),
+                   '--credenciales', str(creds), '--puertos-salida', str(tmp / 'puertos.json'),
+                   # VLANs vistas en cada puerto en los ultimos 7 dias (la primera vez se arma desde el historial)
+                   '--memoria-vlan', str(BASE / 'vlanmem' / f'{mapa}.json'), '--historial', str(HISTORIAL / mapa),
+                   '--cache-olt', str(BASE / 'olt')]
+            for r in routers:
+                cmd += ['--router', r]
+            for s in switches:
+                cmd += ['--switch', s]
+            if auto:
+                cmd.append('--auto-vecinos')
+            if barrido:
+                cmd.append('--barrido')
+            try:
+                salida_anexar = correr(cmd, log)
+            finally:
+                creds.unlink(missing_ok=True)
+            n_auto = next((re.search(r'\((\d+)\)', l).group(1) for l in salida_anexar
+                           if l.startswith('Agregados automaticamente')), '0')
+            bloq = next(('; ' + l for l in salida_anexar if l.startswith('Puertos bloqueados')), '')
+            bloq += next(('; ' + l for l in salida_anexar if l.startswith('Enlaces manuales')), '')
+            bloq += next(('; ' + l for l in salida_anexar if l.startswith('Equipos por PPP/VPN ocultos')), '')
+        else:
+            n_auto, bloq = '0', ''
+        if destino.exists():
+            subprocess.run(['rm', '-rf', str(MAPAS_ROOT / f'{mapa}.anterior')])
+            destino.rename(MAPAS_ROOT / f'{mapa}.anterior')
+        tmp.rename(destino)
+        correr(['/usr/local/bin/seccart2-publicar', str(destino), mapa], log)
+        try:
+            guardar_historial(mapa)
+        except Exception as e:
+            log.append(f'No se pudo guardar el historial: {e}')
+        # lista de puertos de routers/switches para la solapa Puertos de la pagina Hosts (solo lectura para la web)
+        if (destino / 'puertos.json').exists():
+            dir_p = BASE / 'puertos'
+            dir_p.mkdir(exist_ok=True)
+            shutil.chown(dir_p, 'root', 'www-data')
+            os.chmod(dir_p, 0o750)
+            tmp_p = dir_p / f'{mapa}.tmp'
+            tmp_p.write_bytes((destino / 'puertos.json').read_bytes())
+            shutil.chown(tmp_p, 'root', 'www-data')
+            os.chmod(tmp_p, 0o640)
+            tmp_p.replace(dir_p / f'{mapa}.json')
+        guardar_estado(mapa, estado='ok', fin=time.strftime('%Y-%m-%d %H:%M:%S'), log=log[-60:],
+                       resumen=f'{ok} equipos respondieron SNMP en el recorrido; {len(acceso)} equipos de acceso '
+                               f'anexados; {n_auto} vecinos agregados automáticamente{bloq}')
+    except Exception as e:
+        guardar_estado(mapa, estado='error', fin=time.strftime('%Y-%m-%d %H:%M:%S'), log=log[-60:], resumen=str(e))
+
+
+def eliminar_mapa(mapa):
+    """Borra lo publicado de un mapa cuya configuracion ya se elimino desde la pagina Hosts."""
+    if (MAPAS / f'{mapa}.json').exists():
+        return
+    for f in (PUBLICADOS / f'{mapa}.json', ESTADO / f'{mapa}.json', BASE / 'puertos' / f'{mapa}.json',
+              BASE / 'vlanmem' / f'{mapa}.json'):
+        f.unlink(missing_ok=True)
+    for d in (mapa, f'{mapa}.anterior', f'{mapa}.nuevo'):
+        shutil.rmtree(MAPAS_ROOT / d, ignore_errors=True)
+    shutil.rmtree(HISTORIAL / mapa, ignore_errors=True)
+
+
+def credencial_api(v):
+    """{usuario, password} del usuario API de RouterOS guardado en el almacen, o None."""
+    try:
+        c = v.get_ssh_credential(name=API_CRED)
+    except Exception:
+        return None
+    if not c or not getattr(c, 'username', '') or not getattr(c, 'password', ''):
+        return None
+    return {'usuario': c.username, 'password': c.password}
+
+
+def publicar_estado_api(v):
+    """La web solo ve si hay usuario API y su nombre, nunca la contrasena."""
+    c = credencial_api(v)
+    (BASE / 'api.json').write_text(json.dumps({'configurado': bool(c), 'usuario': c['usuario'] if c else ''}))
+    os.chmod(BASE / 'api.json', 0o644)
+
+
+def guardar_api(sol, v):
+    usuario, clave = str(sol.get('usuario', '')), str(sol.get('password', ''))
+    if not API_USUARIO.match(usuario) or not API_CLAVE.match(clave):
+        return
+    try:
+        v.remove_credential(name=API_CRED)
+    except Exception:
+        pass
+    v.add_ssh_credential(name=API_CRED, username=usuario, password=clave, port=8728,
+                         description='Usuario API RouterOS de solo lectura (VLANs del bridge), desde la web')
+
+
+def quitar_api(v):
+    try:
+        v.remove_credential(name=API_CRED)
+    except Exception:
+        pass
+
+
+def agregar_comunidad(sol, v):
+    nombre, comm = str(sol.get('nombre', '')), str(sol.get('community', ''))
+    if not NOMBRE_CRED.match(nombre) or not COMMUNITY.match(comm):
+        return
+    existentes = {c.name for c in v.list_credentials()}
+    if nombre not in existentes:
+        v.add_snmpv2c_credential(name=nombre, community=comm, description='Agregada desde la web',
+                                 priority=100 + len(existentes))
+
+
+def main():
+    for d in (COLA, MAPAS, ESTADO):
+        d.mkdir(parents=True, exist_ok=True)
+    with open(BASE / '.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        v = abrir_vault()
+        for f in MAPAS.glob('*.json'):
+            if NOMBRE_MAPA.match(f.stem):
+                try:
+                    migrar(f.stem, v)
+                except Exception as e:
+                    print(f'No se pudo migrar {f.name}: {e}', file=sys.stderr)
+        try:
+            migrar_inventario()
+        except Exception as e:
+            print(f'No se pudo crear la lista unica de hosts: {e}', file=sys.stderr)
+        publicar_lista_comunidades(v)
+        publicar_estado_api(v)
+        while True:
+            pendientes = sorted(COLA.glob('*.json'), key=lambda p: p.stat().st_mtime)
+            if not pendientes:
+                break
+            for f in pendientes:
+                try:
+                    sol = json.loads(f.read_text(encoding='utf-8'))
+                except Exception:
+                    sol = {}
+                f.unlink(missing_ok=True)   # se borra antes de procesar: puede contener una comunidad
+                accion = sol.get('accion')
+                if accion == 'comunidad':
+                    agregar_comunidad(sol, v)
+                    publicar_lista_comunidades(v)
+                elif accion == 'api_usuario':
+                    guardar_api(sol, v)
+                    publicar_estado_api(v)
+                elif accion == 'api_quitar':
+                    quitar_api(v)
+                    publicar_estado_api(v)
+                elif accion == 'eliminar' and NOMBRE_MAPA.match(str(sol.get('mapa', ''))):
+                    eliminar_mapa(sol['mapa'])
+                elif accion == 'actualizar' and NOMBRE_MAPA.match(str(sol.get('mapa', ''))):
+                    if (MAPAS / f"{sol['mapa']}.json").exists():
+                        actualizar(sol['mapa'], v)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,6 @@
+[Unit]
+Description=Encola la actualizacion automatica de los mapas web (SecureCartography2)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/seccart-web-auto

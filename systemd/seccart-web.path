@@ -1,0 +1,9 @@
+[Unit]
+Description=Vigila la cola de solicitudes de la web de mapas
+
+[Path]
+PathExistsGlob=/var/lib/seccart-web/cola/*.json
+Unit=seccart-web.service
+
+[Install]
+WantedBy=multi-user.target

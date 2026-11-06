@@ -1,0 +1,3096 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mapa de red</title>
+
+    <!-- Cytoscape.js from CDN -->
+    <script src="vendor/cytoscape.min.js"></script>
+
+    <!-- Dagre layout extension for hierarchical graphs -->
+    <script src="vendor/dagre.min.js"></script>
+    <script src="vendor/cytoscape-dagre.js"></script>
+
+    <!-- fCoSE layout extension (fast compound spring embedder) -->
+    <script src="vendor/layout-base.js"></script>
+    <script src="vendor/cose-base.js"></script>
+    <script src="vendor/cytoscape-fcose.js"></script>
+
+    <!-- Cola layout extension (constraint-based) -->
+    <script src="vendor/cola.min.js"></script>
+    <script src="vendor/cytoscape-cola.js"></script>
+
+    <!-- Fondo de mapa geografico (calles / satelite) -->
+    <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+    <script src="vendor/leaflet/leaflet.js"></script>
+
+    <!-- Version web: sin QWebChannel, el mapa se carga por HTTP (ver final del archivo) -->
+
+    <style>
+        :root {
+            --bg-primary: #16181d;
+            --bg-surface: #1c1f26;
+            --text-primary: #e6e8eb;
+            --text-secondary: #aab1bc;
+            --accent-primary: #3b82f6;
+            --accent-secondary: #2563eb;
+            --border-color: #2c313b;
+            --node-border: #3b82f6;
+            --edge-color: #7c8491;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg-primary);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            overflow: hidden;
+        }
+
+        #cy { width: 100vw; height: 100vh; position: relative; z-index: 1; }
+        /* Fondo de mapa: detras de los equipos; con "Ajustar mapa" recibe el mouse */
+        #geo { position: fixed; inset: 0; z-index: 0; display: none; background: #16181d; }
+        body.con-geo #geo { display: block; }
+        body.ajustando-geo #cy { pointer-events: none; }
+        body.ajustando-geo #geo { cursor: grab; }
+        #geo.geo-oscuro .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9); }
+        #geo .leaflet-control-attribution { background: rgba(22,24,29,.75); color: #aab1bc; font-size: 10px; }
+        #geo .leaflet-control-attribution a { color: #93c5fd; }
+        #geo-ajuste { position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 1100; display: none;
+            background: var(--bg-surface); border: 1px solid var(--accent-primary); border-radius: 8px; padding: 10px 14px;
+            color: var(--text-primary); font-size: 13px; gap: 10px; align-items: center; flex-wrap: wrap; max-width: calc(100vw - 32px);
+            box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+        body.ajustando-geo #geo-ajuste { display: flex; }
+        #geo-ajuste { width: 640px; }
+        #geo-ajuste .ga-fila { display: flex; align-items: center; gap: 8px; width: 100%; flex-wrap: wrap; }
+        #geo-ajuste .ga-fila b { width: 150px; font-weight: 600; }
+        #geo-ajuste input[type=range] { flex: 1; min-width: 140px; accent-color: var(--accent-primary); }
+        #geo-ajuste .ga-v { min-width: 150px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+        #geo-ajuste .ga-mm { position: static; width: 30px; height: 30px; padding: 0; font-size: 16px; line-height: 1; }
+        #geo .leaflet-control-scale-line { background: rgba(22,24,29,.8); color: #e6e8eb; border-color: #e6e8eb; }
+        #hist { position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 1050; display: none;
+            width: min(980px, calc(100vw - 32px)); background: var(--bg-surface); border: 1px solid var(--border-color);
+            border-radius: 10px; padding: 10px 14px; color: var(--text-primary); font-size: 13px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.5); flex-direction: column; gap: 8px; }
+        body.con-hist #hist { display: flex; }
+        body.con-hist #stats-bar { display: none; }
+        #hist .h-fila { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        #hist input[type=range] { flex: 1; min-width: 160px; accent-color: var(--accent-primary); }
+        #hist .ctrl-btn { position: static; }
+        #hist .h-fecha { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 150px; }
+        #hist .h-vivo { color: #4ade80; font-weight: 600; }
+        #hist .h-cambios { color: var(--text-secondary); }
+        #hist .h-mas { color: #4ade80; font-weight: 600; } #hist .h-menos { color: #f87171; font-weight: 600; }
+        #hist .h-quitados { color: var(--text-secondary); font-size: 12px; max-height: 48px; overflow: auto; }
+        #btn-hist.activo { background: var(--accent-primary); color: var(--bg-primary); }
+        #btn-geo.activo { background: var(--accent-primary); color: var(--bg-primary); }
+        #btn-blanco.activo { background: var(--accent-primary); color: var(--bg-primary); }
+        body.fondo-blanco { background: #ffffff; }
+
+        #info-panel {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px;
+            min-width: 200px;
+            max-width: 300px;
+            display: none;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        #info-panel.active { display: block; }
+        #info-panel h4 { color: var(--accent-primary); margin-bottom: 8px; font-size: 14px; }
+        .info-item { color: var(--text-primary); font-size: 12px; margin: 4px 0; }
+        .info-item strong { color: var(--text-secondary); }
+
+        /* --- Device detail modal --- */
+        #device-modal {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            display: none;
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+        #device-modal.active { display: flex; }
+        #dm-box {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            width: min(900px, 92vw);
+            max-height: 86vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.45);
+        }
+        #dm-head {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        #dm-title { color: var(--accent-primary); font-size: 16px; font-weight: 600; }
+        #dm-sub { color: var(--text-secondary); font-size: 12px; }
+        #dm-close {
+            margin-left: auto;
+            cursor: pointer;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 20px;
+            line-height: 1;
+            padding: 0 4px;
+        }
+        #dm-close:hover { color: var(--accent-primary); }
+        #dm-tabs {
+            display: flex;
+            gap: 2px;
+            padding: 0 12px;
+            border-bottom: 1px solid var(--border-color);
+            flex-wrap: wrap;
+        }
+        .dm-tab {
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-secondary);
+            font-size: 12px;
+            padding: 9px 12px;
+            cursor: pointer;
+        }
+        .dm-tab:hover { color: var(--text-primary); }
+        .dm-tab.active { color: var(--accent-primary); border-bottom-color: var(--accent-primary); }
+        .dm-tab .dm-count { opacity: 0.6; font-size: 11px; }
+        #dm-body { padding: 14px 16px; overflow: auto; }
+        .dm-pane { display: none; }
+        .dm-pane.active { display: block; }
+        table.dm-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        table.dm-table th, table.dm-table td {
+            text-align: left;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border-color);
+            color: var(--text-primary);
+            vertical-align: top;
+            word-break: break-word;
+        }
+        table.dm-table th { color: var(--text-secondary); font-weight: 600; position: sticky; top: 0; background: var(--bg-surface); }
+        table.dm-table td.dm-key { color: var(--text-secondary); width: 30%; white-space: nowrap; }
+        table.dm-table tr:last-child td { border-bottom: none; }
+        .dm-empty { color: var(--text-secondary); font-size: 12px; font-style: italic; padding: 10px 2px; }
+        .dm-filter {
+            width: 100%;
+            box-sizing: border-box;
+            margin-bottom: 8px;
+            padding: 6px 8px;
+            font-size: 12px;
+            border-radius: 5px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-base, var(--bg-surface));
+            color: var(--text-primary);
+        }
+        .dm-err { color: #e06c6c; font-size: 12px; margin: 3px 0; }
+        .dm-section { color: var(--text-secondary); font-size: 11px; font-weight: 600;
+                      text-transform: uppercase; letter-spacing: 0.5px; margin: 14px 0 6px; }
+        .dm-pre {
+            margin: 0;
+            padding: 10px 12px;
+            max-height: 60vh;
+            overflow: auto;
+            white-space: pre;
+            font-family: "JetBrains Mono", Consolas, "SF Mono", Menlo, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+        .dm-meta { color: var(--text-secondary); font-size: 11px; margin: 6px 2px 0; }
+
+        #stats-bar {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            z-index: 1000;
+        }
+        #stats-bar span { color: var(--accent-primary); font-weight: 600; }
+
+        /* Debug panel */
+        #debug-panel {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.85);
+            border: 1px solid #ff6b6b;
+            border-radius: 8px;
+            padding: 12px;
+            min-width: 300px;
+            max-width: 400px;
+            max-height: 300px;
+            overflow-y: auto;
+            z-index: 2000;
+            font-family: monospace;
+            font-size: 11px;
+        }
+        #debug-panel h4 { color: #ff6b6b; margin-bottom: 8px; }
+        #debug-log { color: #00ff88; }
+        #debug-log .error { color: #ff6b6b; }
+        #debug-log .warn { color: #ffaa00; }
+        #debug-log .info { color: #00d4ff; }
+
+        #loading {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+        #loading.hidden { display: none; }
+        .spinner {
+            width: 40px; height: 40px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent-primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        #controls {
+            position: fixed;
+            top: 10px;
+            left: 12px;
+            right: 12px;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 8px;
+            z-index: 1000;
+            pointer-events: none;   /* el espacio vacio de la barra no bloquea el mapa */
+        }
+        #controls > * { pointer-events: auto; }
+        #estado-mapa:empty, #titulo-mapa:empty { display: none; }
+        #controls.hidden { display: none; }
+        .ctrl-btn {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .ctrl-btn:hover { background: var(--accent-primary); color: var(--bg-primary); }
+        /* Menu "Tipos": ocultar / mostrar equipos por tipo */
+        #menu-tipos { position: relative; }
+        #btn-tipos.activo { background: var(--accent-primary); color: var(--bg-primary); }
+        #panel-tipos { position: absolute; top: calc(100% + 6px); left: 0; z-index: 1200; min-width: 230px;
+            background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 8px; padding: 8px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.5); color: var(--text-primary); font-size: 13px; }
+        #panel-tipos[hidden] { display: none; }
+        #panel-tipos label { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+        #panel-tipos label:hover { background: rgba(59,130,246,.12); }
+        #panel-tipos input { accent-color: var(--accent-primary); width: 16px; height: 16px; }
+        #panel-tipos .pt-c { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+        #panel-tipos .pt-n { margin-left: auto; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+        #panel-tipos .pt-pie { display: flex; gap: 6px; border-top: 1px solid var(--border-color); margin-top: 6px; padding-top: 8px; }
+        #panel-tipos .pt-pie button { flex: 1; position: static; padding: 6px 8px; }
+        #menu-datos { position: relative; }
+        #btn-datos.activo { background: var(--accent-primary); color: var(--bg-primary); }
+        #panel-datos { position: absolute; top: calc(100% + 6px); left: 0; z-index: 1200; min-width: 250px;
+            background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 8px; padding: 8px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.5); color: var(--text-primary); font-size: 13px; }
+        #panel-datos[hidden] { display: none; }
+        #panel-datos label { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+        #panel-datos label:hover { background: rgba(59,130,246,.12); }
+        #panel-datos input { accent-color: var(--accent-primary); width: 16px; height: 16px; }
+        #panel-datos .pt-ej { margin-left: auto; color: var(--text-secondary); font-size: 11px; font-family: monospace; }
+        #panel-datos .pt-pie { display: flex; gap: 6px; border-top: 1px solid var(--border-color); margin-top: 6px; padding-top: 8px; }
+        #panel-datos .pt-pie button { flex: 1; position: static; padding: 6px 8px; }
+    </style>
+</head>
+<body>
+    <div id="cy"></div>
+
+    <div id="debug-panel" hidden>
+        <h4>🔍 JS Debug Log</h4>
+        <div id="debug-log"></div>
+    </div>
+
+    <div id="info-panel">
+        <h4>Device Information</h4>
+        <div id="info-content"></div>
+    </div>
+
+    <div id="device-modal">
+        <div id="dm-box">
+            <div id="dm-head">
+                <span id="dm-title"></span>
+                <span id="dm-sub"></span>
+                <button id="dm-close" title="Close (Esc)">&times;</button>
+            </div>
+            <div id="dm-tabs"></div>
+            <div id="dm-body"></div>
+        </div>
+    </div>
+
+    <div id="geo" aria-hidden="true"></div>
+    <div id="geo-ajuste" role="dialog" aria-label="Ajustar el mapa de fondo">
+        <span style="width:100%">Arrastra el fondo para ubicarlo bajo los equipos. Con <b>Escala</b> encajas toda la red dentro del área real
+            (más escala = los equipos ocupan menos metros).</span>
+        <div class="ga-fila"><b>Escala del fondo</b>
+            <button class="ctrl-btn ga-mm" onclick="pasoEscalaGeo(-0.1)" aria-label="Menos escala">&minus;</button>
+            <input type="range" id="ga-escala" min="12" max="21" step="0.01" oninput="cambiarEscalaGeo(+this.value)" aria-label="Escala del fondo">
+            <button class="ctrl-btn ga-mm" onclick="pasoEscalaGeo(0.1)" aria-label="Más escala">+</button>
+            <span class="ga-v" id="ga-escala-v"></span></div>
+        <div class="ga-fila"><b>Tamaño de los equipos</b>
+            <button class="ctrl-btn ga-mm" onclick="pasoTamGeo(-0.1)" aria-label="Equipos más chicos">&minus;</button>
+            <input type="range" id="ga-tam" min="0.3" max="2" step="0.05" oninput="cambiarTamGeo(+this.value)" aria-label="Tamaño de los equipos">
+            <button class="ctrl-btn ga-mm" onclick="pasoTamGeo(0.1)" aria-label="Equipos más grandes">+</button>
+            <span class="ga-v" id="ga-tam-v"></span></div>
+        <div class="ga-fila" style="justify-content:flex-end">
+            <button class="ctrl-btn" onclick="terminarAjusteGeo(false)" style="position:static">Cancelar</button>
+            <button class="ctrl-btn" onclick="terminarAjusteGeo(true)" style="position:static;background:var(--accent-primary);color:#fff">Guardar ajuste</button></div>
+    </div>
+
+    <div id="hist" role="region" aria-label="Historial del mapa">
+        <div class="h-fila">
+            <button class="ctrl-btn" onclick="pasoHist(-1)" title="Instante anterior" aria-label="Instante anterior">&#9664;</button>
+            <input type="range" id="h-slider" min="0" max="0" value="0" aria-label="Momento del historial"
+                   oninput="moverHist(+this.value)">
+            <button class="ctrl-btn" onclick="pasoHist(1)" title="Instante siguiente" aria-label="Instante siguiente">&#9654;</button>
+            <button class="ctrl-btn" id="h-play" onclick="reproducirHist()" title="Recorre el historial automáticamente">Reproducir</button>
+            <button class="ctrl-btn" onclick="moverHist(hist.items.length)" title="Vuelve al mapa actual">En vivo</button>
+            <button class="ctrl-btn" onclick="alternarHistorial(false)" aria-label="Cerrar historial">&times;</button>
+        </div>
+        <div class="h-fila"><span class="h-fecha" id="h-fecha"></span><span class="h-cambios" id="h-cambios"></span></div>
+        <div class="h-quitados" id="h-quitados" hidden></div>
+    </div>
+
+    <div id="stats-bar">
+        Nodes: <span id="node-count">0</span> |
+        Edges: <span id="edge-count">0</span>
+    </div>
+
+    <div id="controls" class="hidden">
+        <a id="titulo-mapa" class="ctrl-btn" href="./" title="Ver todos los mapas" style="font-weight:600;text-decoration:none"></a>
+        <button class="ctrl-btn" id="btn-actualizar" onclick="actualizarMapa()" title="Vuelve a consultar la red (SNMP, ARP, LLDP, IP neighbor) y recarga el mapa">&#x27F3; Actualizar</button>
+        <span id="estado-mapa" class="ctrl-btn" style="cursor:default;opacity:.85"></span>
+        <button class="ctrl-btn" onclick="TopologyViewer.applyLayout('ordenado')" title="Vuelve al orden guardado (o al automático si no hay uno guardado)">Ordenado</button>
+        <button class="ctrl-btn" id="btn-seleccionar" onclick="alternarSeleccion()"
+                title="Arrastra sobre el fondo para seleccionar varios equipos y arrastra uno de ellos para moverlos juntos. Esc quita la selección. Sin este modo: Shift + arrastrar.">Seleccionar</button>
+        <button class="ctrl-btn" id="btn-guardar" onclick="guardarPosiciones()" title="Guarda la posición de los equipos tal como están; el botón Ordenado vuelve a este orden">Guardar</button>
+        <button class="ctrl-btn" id="btn-auto" onclick="borrarPosiciones()" hidden title="Borra el orden guardado y vuelve al orden automático">Orden automático</button>
+        <button class="ctrl-btn" id="btn-hist" onclick="alternarHistorial()" title="Cómo estaba la red en cada actualización (últimos 7 días)">Historial</button>
+        <button class="ctrl-btn" id="btn-geo" onclick="alternarGeo()" hidden title="Muestra u oculta el mapa de calles / satelital de fondo">Mapa</button>
+        <button class="ctrl-btn" id="btn-geo-ajustar" onclick="empezarAjusteGeo()" hidden title="Mueve y acerca el mapa de fondo para que coincida con los equipos">Ajustar mapa</button>
+        <button class="ctrl-btn" id="btn-blanco" onclick="alternarBlanco()" title="Cambia el fondo del mapa a blanco (para imprimir o presentar). Se recuerda para este mapa.">Fondo blanco</button>
+        <div id="menu-tipos">
+            <button class="ctrl-btn" id="btn-tipos" onclick="alternarPanelTipos(event)" aria-expanded="false" aria-controls="panel-tipos"
+                    title="Ocultar o mostrar equipos por tipo">Tipos &#9662;</button>
+            <div id="panel-tipos" hidden role="group" aria-label="Tipos de equipo visibles"></div>
+        </div>
+        <div id="menu-datos">
+            <button class="ctrl-btn" id="btn-datos" onclick="alternarPanelDatos(event)" aria-expanded="false" aria-controls="panel-datos"
+                    title="Elegir qué datos se ven debajo de cada equipo (IP, RSTP, marca)">Datos &#9662;</button>
+            <div id="panel-datos" hidden role="group" aria-label="Datos visibles en los equipos"></div>
+        </div>
+        <button class="ctrl-btn" onclick="TopologyViewer.fitView()">Fit View</button>
+        <button class="ctrl-btn" onclick="alternarEtiquetas()">Puertos</button>
+        <button class="ctrl-btn" id="btn-indirectos" onclick="alternarIndirectos()" hidden
+                title="Muestra (línea entrecortada) los equipos que se ven por VLAN, túnel o a través de otro switch, sin cable directo">Indirectos</button>
+        <select class="ctrl-btn" id="sel-vlan" onchange="elegirVlan(this.value)" hidden
+                title="Resalta por dónde pasa una VLAN y permite trazar el camino entre dos equipos"></select>
+        <button class="ctrl-btn" onclick="TopologyViewer.applyLayout('dagre')">Hierarchical</button>
+        <button class="ctrl-btn" onclick="TopologyViewer.applyLayout('cose')">Force Layout</button>
+        <button class="ctrl-btn" onclick="TopologyViewer.applyLayout('fcose')">fCoSE</button>
+        <button class="ctrl-btn" onclick="descargarPNG()">Descargar PNG</button>
+        <button class="ctrl-btn" onclick="location.href='./'">&larr; Mapas</button>
+    </div>
+
+    <div id="loading" class="hidden">
+        <div class="spinner"></div>
+    </div>
+<script>
+/**
+ * Debug logger - writes to both console and debug panel
+ */
+const DebugLog = {
+    panel: null,
+
+    init() {
+        this.panel = document.getElementById('debug-log');
+        this.log('info', 'Debug logger initialized');
+    },
+
+    log(level, msg) {
+        const timestamp = new Date().toISOString().substr(11, 12);
+        const line = `[${timestamp}] ${msg}`;
+
+        if (level === 'error') console.error(line);
+        else if (level === 'warn') console.warn(line);
+        else console.log(line);
+
+        if (this.panel) {
+            const div = document.createElement('div');
+            div.className = level;
+            div.textContent = line;
+            this.panel.appendChild(div);
+            this.panel.scrollTop = this.panel.scrollHeight;
+
+            while (this.panel.children.length > 50) {
+                this.panel.removeChild(this.panel.firstChild);
+            }
+        }
+    },
+
+    info(msg) { this.log('info', msg); },
+    warn(msg) { this.log('warn', msg); },
+    error(msg) { this.log('error', msg); }
+};
+
+/**
+ * TopologyViewer - Portable Cytoscape.js viewer
+ */
+const TopologyViewer = {
+    cy: null,
+    bridge: null,
+    iconBasePath: '',
+    platformMap: null,
+    loadCount: 0,
+    defaultLayout: 'dagre',   // host can override (preview uses 'cose')
+    lastLayout: null,
+    dagreAvailable: false,
+    fcoseAvailable: false,
+    colaAvailable: false,
+
+    init() {
+        DebugLog.init();
+        DebugLog.info('TopologyViewer.init() called');
+
+        // Register dagre extension if available
+        if (typeof cytoscapeDagre !== 'undefined') {
+            cytoscape.use(cytoscapeDagre);
+            this.dagreAvailable = true;
+            DebugLog.info('Dagre layout extension registered');
+        } else {
+            DebugLog.warn('Dagre extension not available - hierarchical layout will fallback');
+        }
+
+        // Register fCoSE extension if available
+        if (typeof cytoscapeFcose !== 'undefined') {
+            cytoscape.use(cytoscapeFcose);
+            this.fcoseAvailable = true;
+            DebugLog.info('fCoSE layout extension registered');
+        }
+
+        // Register Cola extension if available
+        if (typeof cytoscapeCola !== 'undefined') {
+            cytoscape.use(cytoscapeCola);
+            this.colaAvailable = true;
+            DebugLog.info('Cola layout extension registered');
+        }
+
+        // Setup QWebChannel bridge
+        if (typeof QWebChannel !== 'undefined') {
+            DebugLog.info('QWebChannel found, connecting...');
+
+            new QWebChannel(qt.webChannelTransport, (channel) => {
+                this.bridge = channel.objects.bridge;
+                DebugLog.info('QWebChannel connected!');
+
+                if (this.bridge) {
+                    DebugLog.info('Bridge methods: ' + Object.keys(this.bridge).join(', '));
+
+                    if (this.bridge.onViewerReady) {
+                        this.bridge.onViewerReady();
+                        DebugLog.info('onViewerReady() called');
+                    }
+                }
+            });
+        } else {
+            DebugLog.warn('No QWebChannel - standalone mode');
+        }
+
+        // Initialize Cytoscape
+        DebugLog.info('Initializing Cytoscape...');
+        this.cy = cytoscape({
+            container: document.getElementById('cy'),
+            elements: [],
+            style: this.getStyles(),
+            layout: { name: 'preset' },
+            minZoom: 0.1,
+            maxZoom: 4,
+            wheelSensitivity: 0.3,
+            // Shift + arrastrar sobre el fondo = seleccion por recuadro (con "Seleccionar", sin Shift)
+            boxSelectionEnabled: true,
+            selectionType: 'additive'
+        });
+
+        this.setupEventHandlers();
+        this.hideLoading();
+
+        DebugLog.info('Init complete!');
+    },
+
+    getStyles() {
+        const root = getComputedStyle(document.documentElement);
+        const textColor = root.getPropertyValue('--text-primary').trim() || '#e6e8eb';
+        const bgColor = root.getPropertyValue('--bg-surface').trim() || '#1c1f26';
+        const accentColor = root.getPropertyValue('--accent-primary').trim() || '#3b82f6';
+        const edgeColor = root.getPropertyValue('--edge-color').trim() || '#7c8491';
+
+        return [
+            {
+                selector: 'node',
+                style: {
+                    'background-color': 'data(vendorFill)',
+                    'background-image': 'data(icon)',
+                    'background-fit': 'contain',
+                    'background-clip': 'none',
+                    'width': 50,
+                    'height': 50,
+                    'label': 'data(label)',
+                    'text-valign': 'bottom',
+                    'text-halign': 'center',
+                    'text-margin-y': 5,
+                    'font-size': '10px',
+                    'font-weight': '500',
+                    'color': () => fondoBlanco ? '#111827' : textColor,
+                    'text-background-color': () => fondoBlanco ? '#ffffff' : bgColor,
+                    'text-background-opacity': 0.9,
+                    'text-border-width': () => fondoBlanco ? 1 : 0, 'text-border-color': '#cbd5e1', 'text-border-opacity': 1,
+                    'text-background-padding': '3px',
+                    'text-background-shape': 'roundrectangle',
+                    'border-width': 2,
+                    'border-color': 'data(vendorColor)',
+                    'border-opacity': 0.8
+                }
+            },
+            {
+                selector: 'node[?discovered]',  // discovered = true (truthy)
+                style: {
+                    'border-style': 'solid'
+                }
+            },
+            {
+                selector: 'node[!discovered]',  // discovered = false (falsy)
+                style: {
+                    'border-style': 'dashed',
+                    'border-color': '#ff6b6b',
+                    'border-width': 2,
+                    'border-opacity': 0.8,
+                    'opacity': 0.7
+                }
+            },
+            {
+                selector: 'node.pending',  // queued, not dialed yet
+                style: {
+                    'border-style': 'dashed',
+                    'border-color': accentColor,
+                    'background-color': bgColor,
+                    'background-image-opacity': 0.25,
+                    'opacity': 0.6
+                }
+            },
+            {
+                selector: 'node.notdialed',  // seen as a neighbor, never dialed
+                style: {
+                    'border-style': 'dashed',
+                    'border-color': edgeColor,
+                    'background-color': bgColor,
+                    'opacity': 0.55
+                }
+            },
+            {
+                selector: 'node.failed',  // dialed, discovery failed
+                style: {
+                    'border-style': 'dashed',
+                    'border-color': '#ef4444',
+                    'opacity': 0.85
+                }
+            },
+            {
+                selector: 'node:selected',
+                style: {
+                    'border-width': 4,
+                    'border-opacity': 1
+                }
+            },
+            {
+                selector: 'edge',
+                style: {
+                    'width': 2,
+                    'line-color': edgeColor,
+                    'curve-style': 'bezier',
+                    'label': 'data(label)',
+                    'font-size': '8px',
+                    'color': () => fondoBlanco ? '#111827' : textColor,
+                    'text-wrap': 'wrap',
+                    'text-background-color': () => fondoBlanco ? '#ffffff' : bgColor,
+                    'text-background-opacity': 0.9,
+                    'text-border-width': () => fondoBlanco ? 1 : 0, 'text-border-color': '#cbd5e1', 'text-border-opacity': 1,
+                    'text-background-padding': '2px',
+                    'text-background-shape': 'roundrectangle',
+                    'text-rotation': 'autorotate',
+                    'text-margin-y': -8
+                }
+            },
+            {
+                // Muchas VLANs: bloque horizontal ordenado en filas, centrado en el cable
+                selector: 'edge[?vlanBloque]',
+                style: { 'text-rotation': 'none', 'text-margin-y': 0,
+                         'text-background-padding': '4px' }
+            },
+            {
+                // Learned from a routing table (BGP/OSPF/EIGRP), not CDP/LLDP
+                selector: 'edge[?routing]',
+                style: { 'line-style': 'dashed', 'line-dash-pattern': [6, 4] }
+            },
+            {
+                // Camino alternativo RSTP (puerto bloqueado): punteado y en ambar
+                selector: 'edge[?backup]',
+                style: { 'line-style': 'dashed', 'line-dash-pattern': [4, 4], 'line-color': '#f59e0b',
+                         'target-arrow-color': '#f59e0b', 'opacity': 0.75 }
+            },
+            {
+                // Enlace manual (pagina Hosts): violeta
+                selector: 'edge[?manual]',
+                style: { 'line-color': '#a78bfa', 'target-arrow-color': '#a78bfa' }
+            },
+            {
+                selector: 'edge:selected',
+                style: { 'width': 3, 'line-color': accentColor }
+            }
+        ];
+    },
+
+    setupEventHandlers() {
+        if (!this.cy) return;
+
+        // Modal close: X button, backdrop click, and Esc.
+        const modal = document.getElementById('device-modal');
+        if (modal && !modal.dataset.wired) {
+            modal.dataset.wired = '1';
+            document.getElementById('dm-close').onclick = () => this.hideNodeInfo();
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) this.hideNodeInfo();
+            });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') this.hideNodeInfo();
+            });
+        }
+
+        // Single-click: show info panel
+        this.cy.on('tap', 'node', (evt) => {
+            const node = evt.target;
+            this.showNodeInfo(node.data());
+            if (this.bridge && this.bridge.onNodeSelected) {
+                this.bridge.onNodeSelected(JSON.stringify(node.data()));
+            }
+        });
+
+        // Double-click: request edit dialog
+        this.cy.on('dblclick', 'node', (evt) => {
+            const node = evt.target;
+            const data = node.data();
+            DebugLog.info('Node edit requested: ' + data.id);
+
+            if (this.bridge && this.bridge.onNodeEditRequested) {
+                this.bridge.onNodeEditRequested(JSON.stringify(data));
+            }
+        });
+
+        this.cy.on('tap', 'edge', (evt) => {
+            const edge = evt.target;
+            this.showEdgeInfo(edge.data());
+            if (this.bridge && this.bridge.onEdgeSelected) {
+                this.bridge.onEdgeSelected(JSON.stringify(edge.data()));
+            }
+        });
+
+        this.cy.on('tap', (evt) => {
+            if (evt.target === this.cy) {
+                this.hideInfoPanel();
+            }
+        });
+
+        this.cy.on('dragfree', 'node', () => {
+            if (this.bridge && this.bridge.onLayoutChanged) {
+                this.bridge.onLayoutChanged(this.exportPositions());
+            }
+        });
+    },
+
+    /**
+     * Update a node's data and visual appearance (called from Python)
+     */
+    updateNode(nodeId, b64Data) {
+        DebugLog.info('updateNode: ' + nodeId);
+
+        try {
+            const jsonStr = atob(b64Data);
+            const data = JSON.parse(jsonStr);
+
+            const node = this.cy.getElementById(nodeId);
+            if (node && node.length > 0) {
+                // Update node data
+                node.data(data);
+
+                // Update visual style based on discovered status
+                const accentColor = getComputedStyle(document.documentElement)
+                    .getPropertyValue('--accent-primary').trim() || '#3b82f6';
+
+                if (data.discovered === false) {
+                    node.style({
+                        'border-style': 'dashed',
+                        'border-color': '#ff6b6b',
+                        'opacity': 0.7
+                    });
+                    // Update label to show warning if not already there
+                    if (!data.label.includes('⚠')) {
+                        node.data('label', data.label + ' ⚠');
+                    }
+                } else {
+                    node.style({
+                        'border-style': 'solid',
+                        'border-color': accentColor,
+                        'opacity': 1
+                    });
+                    // Remove warning indicator if present
+                    const label = node.data('label');
+                    if (label && label.includes(' ⚠')) {
+                        node.data('label', label.replace(' ⚠', ''));
+                    }
+                }
+
+                // Update icon if provided
+                if (data.icon) {
+                    node.style('background-image', data.icon);
+                }
+
+                this.updateStats();
+                DebugLog.info('Node updated successfully');
+            } else {
+                DebugLog.warn('Node not found: ' + nodeId);
+            }
+        } catch (e) {
+            DebugLog.error('updateNode error: ' + e.message);
+        }
+    },
+
+    /**
+     * Load topology from base64-encoded JSON (called from Python)
+     */
+    loadTopologyB64(b64String) {
+        DebugLog.info('loadTopologyB64() called');
+        try {
+            const jsonString = atob(b64String);
+            this.loadTopology(jsonString);
+        } catch (error) {
+            DebugLog.error('B64 decode error: ' + error.message);
+        }
+    },
+
+    /**
+     * Live crawl: merge a cumulative SC2 map into the current graph.
+     * Existing nodes keep their identity; placeholders that became real
+     * devices are upgraded in place; only new elements are added. The
+     * layout re-runs (animated) only when something was added.
+     */
+    mergeTopologyB64(b64String) {
+        try {
+            const payload = JSON.parse(atob(b64String));
+            this.mergeTopology(payload.map || {}, payload.status || {});
+        } catch (error) {
+            DebugLog.error('mergeTopologyB64 error: ' + error.message);
+        }
+    },
+
+    mergeTopology(mapData, status) {
+        if (!this.cy) return;
+        const elements = this.parseMapFormat(mapData);
+        const newIds = new Set();
+        let added = 0;
+
+        this.cy.batch(() => {
+            for (const el of elements) {
+                if (el.group !== 'nodes') continue;
+                const existing = this.cy.getElementById(el.data.id);
+                if (existing.length === 0) {
+                    this.cy.add(el);
+                    newIds.add(el.data.id);
+                    added++;
+                } else if (el.data.discovered && !existing.data('discovered')) {
+                    existing.data(el.data);
+                    existing.removeClass('failed notdialed');
+                }
+            }
+            for (const el of elements) {
+                if (el.group !== 'edges') continue;
+                if (this.cy.getElementById(el.data.id).length === 0) {
+                    this.cy.add(el);
+                    added++;
+                }
+            }
+            this.applyNodeStatus(status);
+        });
+
+        // Start new nodes at a neighbour's position so the layout
+        // animation grows the graph outward instead of flying in from 0,0.
+        newIds.forEach(id => {
+            const node = this.cy.getElementById(id);
+            const anchor = node.neighborhood('node').filter(n => !newIds.has(n.id())).first();
+            if (anchor && anchor.length) {
+                const p = anchor.position();
+                node.position({ x: p.x + (Math.random() - 0.5) * 20, y: p.y + 40 });
+            }
+        });
+
+        if (added > 0) {
+            this.applyLayout(this.lastLayout || this.defaultLayout || 'dagre');
+        }
+        this.updateStats();
+    },
+
+    /**
+     * status: {nodeId: 'failed' | 'not_dialed'} for undiscovered nodes.
+     * Undiscovered nodes with no status are still queued (pending), and are
+     * drawn neutral so a crawl in progress doesn't read as failing.
+     */
+    applyNodeStatus(status) {
+        status = status || {};
+        this.cy.nodes('[!discovered]').forEach(n => {
+            const st = status[n.id()];
+            n.toggleClass('failed', st === 'failed');
+            n.toggleClass('notdialed', st === 'not_dialed');
+            n.toggleClass('pending', !st);
+            n.data('label', st === 'failed' ? n.id() + ' ⚠' : n.id());
+        });
+    },
+
+    /**
+     * Load topology - MAIN ENTRY POINT
+     */
+    loadTopology(jsonString) {
+        this.loadCount++;
+        DebugLog.info('loadTopology() call #' + this.loadCount);
+
+        if (!jsonString) {
+            DebugLog.error('Empty input!');
+            return;
+        }
+
+        this.showLoading();
+
+        try {
+            let data = typeof jsonString === 'string' ? JSON.parse(jsonString) : jsonString;
+
+            let elements = [];
+            if (data.cytoscape) {
+                DebugLog.info('Format: VelocityMaps');
+                elements = this.parseCytoscapeFormat(data.cytoscape);
+            } else if (data.nodes && data.edges) {
+                DebugLog.info('Format: Cytoscape');
+                elements = this.parseCytoscapeFormat(data);
+            } else if (typeof data === 'object' && !Array.isArray(data)) {
+                DebugLog.info('Format: SC2 map.json');
+                elements = this.parseMapFormat(data);
+            }
+
+            this.cy.elements().remove();
+            this.cy.add(elements);
+
+            DebugLog.info('Loaded: ' + this.cy.nodes().length + ' nodes, ' + this.cy.edges().length + ' edges');
+
+            this.updateStats();
+
+            // Host-configurable default (dagre unless overridden)
+            this.applyLayout(this.defaultLayout || 'dagre');
+
+            this.hideLoading();
+
+        } catch (error) {
+            DebugLog.error('loadTopology error: ' + error.message);
+            this.hideLoading();
+        }
+    },
+
+    testLoad() {
+        const testData = {
+            "core-switch": {
+                "node_details": { "ip": "10.0.0.1", "platform": "Cisco Catalyst 9500" },
+                "peers": {
+                    "dist-sw-1": { "connections": [["Gi1/0/1", "Gi0/1"]] },
+                    "dist-sw-2": { "connections": [["Gi1/0/2", "Gi0/1"]] }
+                }
+            },
+            "dist-sw-1": {
+                "node_details": { "ip": "10.0.1.1", "platform": "Arista DCS-7050" },
+                "peers": {
+                    "core-switch": { "connections": [["Gi0/1", "Gi1/0/1"]] },
+                    "access-1": { "connections": [["Gi1/1", "Gi0/1"]] },
+                    "access-2": { "connections": [["Gi1/2", "Gi0/1"]] }
+                }
+            },
+            "dist-sw-2": {
+                "node_details": { "ip": "10.0.2.1", "platform": "Juniper QFX5100" },
+                "peers": {
+                    "core-switch": { "connections": [["Gi0/1", "Gi1/0/2"]] },
+                    "access-3": { "connections": [["Gi1/1", "Gi0/1"]] }
+                }
+            },
+            "access-1": {
+                "node_details": { "ip": "10.0.10.1", "platform": "Cisco WS-C2960" },
+                "peers": { "dist-sw-1": { "connections": [["Gi0/1", "Gi1/1"]] } }
+            },
+            "access-2": {
+                "node_details": { "ip": "10.0.20.1", "platform": "Cisco WS-C2960" },
+                "peers": { "dist-sw-1": { "connections": [["Gi0/1", "Gi1/2"]] } }
+            },
+            "access-3": {
+                "node_details": { "ip": "10.0.30.1", "platform": "Cisco WS-C2960" },
+                "peers": { "dist-sw-2": { "connections": [["Gi0/1", "Gi1/1"]] } }
+            }
+        };
+        this.loadTopology(JSON.stringify(testData));
+    },
+
+    parseCytoscapeFormat(data) {
+        const elements = [];
+
+        if (data.nodes) {
+            data.nodes.forEach(n => {
+                const nodeData = n.data || n;
+                elements.push({
+                    group: 'nodes',
+                    data: {
+                        id: nodeData.id,
+                        label: nodeData.label || nodeData.id,
+                        ip: nodeData.ip || '',
+                        platform: nodeData.platform || 'Unknown',
+                        icon: nodeData.icon || this.getIconForPlatform(nodeData.platform),
+                        discovered: nodeData.discovered !== false,
+                        vendorColor: this.getVendorColor(nodeData.platform, nodeData.id),
+                        vendorFill: this.getVendorFill(nodeData.platform, nodeData.id)
+                    },
+                    position: n.position || undefined
+                });
+            });
+        }
+
+        if (data.edges) {
+            data.edges.forEach(e => {
+                const edgeData = e.data || e;
+                elements.push({
+                    group: 'edges',
+                    data: {
+                        id: edgeData.id || `${edgeData.source}-${edgeData.target}`,
+                        source: edgeData.source,
+                        target: edgeData.target,
+                        label: edgeData.label || ''
+                    }
+                });
+            });
+        }
+
+        return elements;
+    },
+
+    parseMapFormat(data) {
+        const elements = [];
+        const addedEdges = new Set();
+        const nodeIds = new Set();
+
+        // First pass: create discovered nodes
+        for (const [deviceName, deviceData] of Object.entries(data)) {
+            const details = deviceData.node_details || {};
+            nodeIds.add(deviceName);
+
+            elements.push({
+                group: 'nodes',
+                data: {
+                    id: deviceName,
+                    label: deviceName,
+                    ip: details.ip || '',
+                    platform: details.platform || 'Unknown',
+                    model: details.model || '',
+                    serial: details.serial || '',
+                    os_version: details.os_version || '',
+                    vendor: details.vendor || '',
+                    metadata: details.metadata || {},
+                    icon: details.icon || this.getIconForPlatform(details.platform),
+                    discovered: true,
+                    vendorColor: this.getVendorColor(details.platform, deviceName),
+                    vendorFill: this.getVendorFill(details.platform, deviceName)
+                }
+            });
+        }
+
+        // Second pass: create edges and placeholder nodes
+        for (const [deviceName, deviceData] of Object.entries(data)) {
+            const peers = deviceData.peers || {};
+
+            for (const [peerName, peerData] of Object.entries(peers)) {
+                // Create placeholder for undiscovered peer
+                if (!nodeIds.has(peerName)) {
+                    nodeIds.add(peerName);
+                    elements.push({
+                        group: 'nodes',
+                        data: {
+                            id: peerName,
+                            label: peerName + ' ⚠',
+                            ip: '',
+                            platform: 'Undiscovered',
+                            icon: this.getUndiscoveredIcon(),
+                            discovered: false,
+                            vendorColor: '#ff6b6b',
+                            vendorFill: 'rgba(255, 107, 107, 0.2)'
+                        }
+                    });
+                }
+
+                const edgeId = [deviceName, peerName].sort().join('--');
+                if (!addedEdges.has(edgeId)) {
+                    addedEdges.add(edgeId);
+
+                    let label = '';
+                    const connections = peerData.connections || [];
+                    if (connections.length > 0) {
+                        const labels = connections
+                            .filter(c => c.length >= 2)
+                            .map(c => `${c[0]} ↔ ${c[1]}`);
+                        label = labels.join('\n');
+                    }
+
+                    // Dashed only when every connection, seen from both
+                    // ends, came from a routing table. Maps without
+                    // "protocols" (older SC2) stay solid.
+                    const ROUTING = ['bgp', 'ospf', 'eigrp'];
+                    const protos = [...(peerData.protocols || [])];
+                    const back = ((data[peerName] || {}).peers || {})[deviceName];
+                    if (back) protos.push(...(back.protocols || []));
+                    const routing = protos.length > 0 && protos.every(p => ROUTING.includes(p));
+                    // VLANs vistas en el enlace (tabla Bridge > Hosts y PVID, desde seccart2-anexar)
+                    const indir = peerData.indirecto || (back || {}).indirecto || '';
+                    const vls = [...new Set([...(peerData.vlans || []), ...((back || {}).vlans || [])].map(String))]
+                        .sort((a, b) => a - b);
+
+                    elements.push({
+                        group: 'edges',
+                        data: {
+                            id: edgeId,
+                            source: deviceName,
+                            target: peerName,
+                            label: label + (vls.length ? (label ? '\n' : '') + textoVlans(vls) : '') +
+                                   (indir ? '\n(no es cable directo: ' + indir + ')' : ''),
+                            vlans: vls,
+                            // muchas VLANs: la etiqueta va horizontal, en bloque, en vez de a lo largo del cable
+                            vlanBloque: rangosVlan(vls).length > VLAN_EN_LINEA,
+                            // no es cable directo (visto por VLAN, tunel o a traves de otro switch)
+                            indirecto: !!indir,
+                            connectionCount: connections.length,
+                            routing: routing,
+                            protocols: [...new Set(protos)].join('/'),
+                            // Enlace bloqueado por RSTP (camino alternativo), marcado por seccart2-anexar
+                            backup: peerData.rstp === 'respaldo' || ((back || {}).rstp === 'respaldo'),
+                            // Enlace agregado a mano en la pagina Hosts (equipos sin SNMP)
+                            manual: !!peerData.manual || !!(back || {}).manual
+                        }
+                    });
+                }
+            }
+        }
+
+        return elements;
+    },
+
+    getUndiscoveredIcon() {
+        return 'data:image/svg+xml,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                <rect x="4" y="14" width="40" height="20" rx="3" fill="#4a4a4a" stroke="#ff6b6b" stroke-width="2" stroke-dasharray="4,2"/>
+                <text x="24" y="28" text-anchor="middle" fill="#ff6b6b" font-size="16" font-weight="bold">?</text>
+            </svg>
+        `);
+    },
+
+    getIconForPlatform(platform) {
+        if (!platform) return this.getDefaultIcon();
+        const p = platform.toLowerCase();
+        if (p.includes('cisco')) return this.getCiscoSwitchIcon();
+        if (p.includes('arista')) return this.getAristaSwitchIcon();
+        if (p.includes('juniper')) return this.getJuniperSwitchIcon();
+        return this.getDefaultIcon();
+    },
+
+    getCiscoSwitchIcon() {
+        return 'data:image/svg+xml,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                <rect x="4" y="14" width="40" height="20" rx="3" fill="#049fd9" stroke="#00bceb" stroke-width="1.5"/>
+                <circle cx="12" cy="24" r="2.5" fill="#6cc04a"/><circle cx="20" cy="24" r="2.5" fill="#6cc04a"/>
+                <circle cx="28" cy="24" r="2.5" fill="#6cc04a"/><circle cx="36" cy="24" r="2.5" fill="#fbab18"/>
+            </svg>
+        `);
+    },
+
+    getAristaSwitchIcon() {
+        return 'data:image/svg+xml,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                <rect x="4" y="14" width="40" height="20" rx="3" fill="#5c4ee5" stroke="#7c6ef0" stroke-width="1.5"/>
+                <circle cx="12" cy="24" r="2.5" fill="#00e5a0"/><circle cx="20" cy="24" r="2.5" fill="#00e5a0"/>
+                <circle cx="28" cy="24" r="2.5" fill="#00e5a0"/><circle cx="36" cy="24" r="2.5" fill="#ffcc00"/>
+            </svg>
+        `);
+    },
+
+    getJuniperSwitchIcon() {
+        return 'data:image/svg+xml,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                <rect x="4" y="14" width="40" height="20" rx="3" fill="#84bd00" stroke="#a0d911" stroke-width="1.5"/>
+                <circle cx="12" cy="24" r="2.5" fill="#ffffff"/><circle cx="20" cy="24" r="2.5" fill="#ffffff"/>
+                <circle cx="28" cy="24" r="2.5" fill="#ffffff"/><circle cx="36" cy="24" r="2.5" fill="#ff6600"/>
+            </svg>
+        `);
+    },
+
+    getDefaultIcon() {
+        return 'data:image/svg+xml,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+                <rect x="4" y="14" width="40" height="20" rx="3" fill="#2a4a7a" stroke="#4a9eff" stroke-width="2"/>
+                <circle cx="12" cy="24" r="3" fill="#00ff88"/><circle cx="20" cy="24" r="3" fill="#00ff88"/>
+                <circle cx="28" cy="24" r="3" fill="#ffaa00"/><rect x="34" y="20" width="6" height="8" rx="1" fill="#4a9eff"/>
+            </svg>
+        `);
+    },
+
+    // Vendor colors matching draw.io export
+    vendorColors: {
+        'cisco': '#049fd9',    // Cisco blue
+        'juniper': '#F58536',  // Juniper orange
+        'arista': '#2D8659',   // Arista green
+        'paloalto': '#FA582D', // Palo Alto orange-red
+        'fortinet': '#EE3124', // Fortinet red
+        'default': '#4a9eff'   // Default accent blue
+    },
+
+    // Muted fill colors (semi-transparent for background tint)
+    vendorFills: {
+        'cisco': 'rgba(4, 159, 217, 0.25)',
+        'juniper': 'rgba(245, 133, 54, 0.25)',
+        'arista': 'rgba(45, 134, 89, 0.25)',
+        'paloalto': 'rgba(250, 88, 45, 0.25)',
+        'fortinet': 'rgba(238, 49, 36, 0.25)',
+        'default': 'rgba(74, 158, 255, 0.2)'
+    },
+
+    detectVendor(platform, nodeId) {
+        const p = (platform || '').toLowerCase();
+        const n = (nodeId || '').toLowerCase();
+
+        // Juniper patterns
+        const juniperPatterns = ['junos', 'juniper', 'mx', 'qfx', 'ex2', 'ex3', 'ex4', 'srx', 'ptx', 'acx'];
+        for (const pattern of juniperPatterns) {
+            if (p.includes(pattern) || n.includes(pattern)) return 'juniper';
+        }
+
+        // Arista patterns
+        const aristaPatterns = ['arista', 'eos', 'veos', 'dcs-', 'ccs-'];
+        for (const pattern of aristaPatterns) {
+            if (p.includes(pattern) || n.includes(pattern)) return 'arista';
+        }
+
+        // Palo Alto patterns
+        const paloPatterns = ['palo', 'pan-', 'pa-'];
+        for (const pattern of paloPatterns) {
+            if (p.includes(pattern) || n.includes(pattern)) return 'paloalto';
+        }
+
+        // Fortinet patterns
+        const fortiPatterns = ['forti', 'fortigate', 'fortios'];
+        for (const pattern of fortiPatterns) {
+            if (p.includes(pattern) || n.includes(pattern)) return 'fortinet';
+        }
+
+        // Cisco patterns (check last as it's the broadest)
+        const ciscoPatterns = ['cisco', 'ios', 'nx-os', 'nexus', 'catalyst', 'c9', 'ws-c', 'isr', 'asr', 'asa'];
+        for (const pattern of ciscoPatterns) {
+            if (p.includes(pattern) || n.includes(pattern)) return 'cisco';
+        }
+
+        return 'default';
+    },
+
+    getVendorColor(platform, nodeId) {
+        const vendor = this.detectVendor(platform, nodeId);
+        return this.vendorColors[vendor] || this.vendorColors['default'];
+    },
+
+    getVendorFill(platform, nodeId) {
+        const vendor = this.detectVendor(platform, nodeId);
+        return this.vendorFills[vendor] || this.vendorFills['default'];
+    },
+
+    setPlatformMap(mapJson) {
+        try {
+            this.platformMap = JSON.parse(mapJson);
+            DebugLog.info('Platform map loaded');
+        } catch (e) {
+            DebugLog.error('Failed to parse platform map: ' + e.message);
+        }
+    },
+
+    applyLayout(algorithm = 'dagre') {
+        if (!this.cy || this.cy.nodes().length === 0) return;
+        this.lastLayout = algorithm;
+
+        DebugLog.info('Applying layout: ' + algorithm);
+
+        let layoutConfig;
+
+        switch (algorithm) {
+            case 'dagre':
+                if (this.dagreAvailable) {
+                    layoutConfig = {
+                        name: 'dagre',
+                        rankDir: 'TB',           // Top to Bottom
+                        nodeSep: 60,             // Horizontal spacing
+                        rankSep: 80,             // Vertical spacing between tiers
+                        edgeSep: 10,
+                        ranker: 'network-simplex',
+                        animate: true,
+                        animationDuration: 500,
+                        fit: true,
+                        padding: 30
+                    };
+                } else {
+                    DebugLog.warn('Dagre not available, falling back to breadthfirst');
+                    layoutConfig = {
+                        name: 'breadthfirst',
+                        directed: true,
+                        spacingFactor: 1.5,
+                        animate: true,
+                        animationDuration: 500,
+                        fit: true,
+                        padding: 30
+                    };
+                }
+                break;
+
+            case 'dagre-lr':
+                if (this.dagreAvailable) {
+                    layoutConfig = {
+                        name: 'dagre',
+                        rankDir: 'LR',           // Left to Right
+                        nodeSep: 50,
+                        rankSep: 100,
+                        edgeSep: 10,
+                        ranker: 'network-simplex',
+                        animate: true,
+                        animationDuration: 500,
+                        fit: true,
+                        padding: 30
+                    };
+                } else {
+                    DebugLog.warn('Dagre not available, falling back to breadthfirst');
+                    return this.applyLayout('breadthfirst');
+                }
+                break;
+
+            case 'fcose':
+                if (this.fcoseAvailable) {
+                    layoutConfig = {
+                        name: 'fcose',
+                        animate: true,
+                        animationDuration: 500,
+                        quality: 'default',
+                        randomize: true,
+                        nodeDimensionsIncludeLabels: true,
+                        uniformNodeDimensions: false,
+                        packComponents: true,
+                        nodeRepulsion: 6500,
+                        idealEdgeLength: 80,
+                        edgeElasticity: 0.45,
+                        nestingFactor: 0.1,
+                        gravity: 0.25,
+                        gravityRange: 3.8,
+                        fit: true,
+                        padding: 30
+                    };
+                } else {
+                    DebugLog.warn('fCoSE not available, falling back to cose');
+                    return this.applyLayout('cose');
+                }
+                break;
+
+            case 'cola':
+                if (this.colaAvailable) {
+                    layoutConfig = {
+                        name: 'cola',
+                        animate: true,
+                        animationDuration: 500,
+                        maxSimulationTime: 4000,
+                        ungrabifyWhileSimulating: false,
+                        fit: true,
+                        padding: 30,
+                        nodeDimensionsIncludeLabels: true,
+                        avoidOverlap: true,
+                        convergenceThreshold: 0.01,
+                        edgeLength: 120,
+                    };
+                } else {
+                    DebugLog.warn('Cola not available, falling back to cose');
+                    return this.applyLayout('cose');
+                }
+                break;
+
+            case 'cose':
+                layoutConfig = {
+                    name: 'cose',
+                    animate: true,
+                    animationDuration: 500,
+                    nodeRepulsion: 8000,
+                    idealEdgeLength: 100,
+                    gravity: 0.25,
+                    fit: true,
+                    padding: 30
+                };
+                break;
+
+            case 'concentric':
+                layoutConfig = {
+                    name: 'concentric',
+                    animate: true,
+                    animationDuration: 500,
+                    concentric: function(node) {
+                        return node.degree();
+                    },
+                    levelWidth: function(nodes) {
+                        return Math.max(1, Math.floor(nodes.length / 4));
+                    },
+                    minNodeSpacing: 50,
+                    fit: true,
+                    padding: 30
+                };
+                break;
+
+            case 'grid':
+                layoutConfig = {
+                    name: 'grid',
+                    animate: true,
+                    animationDuration: 300,
+                    fit: true,
+                    padding: 30,
+                    avoidOverlap: true,
+                    condense: true
+                };
+                break;
+
+            case 'circle':
+                layoutConfig = {
+                    name: 'circle',
+                    animate: true,
+                    animationDuration: 300,
+                    fit: true,
+                    padding: 30,
+                    avoidOverlap: true
+                };
+                break;
+
+            case 'breadthfirst':
+                layoutConfig = {
+                    name: 'breadthfirst',
+                    animate: true,
+                    animationDuration: 300,
+                    directed: false,
+                    spacingFactor: 1.5,
+                    fit: true,
+                    padding: 30
+                };
+                break;
+
+            default:
+                DebugLog.warn('Unknown layout: ' + algorithm + ', using dagre');
+                return this.applyLayout('dagre');
+        }
+
+        this.cy.layout(layoutConfig).run();
+    },
+
+    fitView() {
+        if (this.cy) this.cy.fit(null, 30);
+    },
+
+    // --- Device detail modal -------------------------------------------
+    // Device-supplied strings (sysDescr, entPhysical columns, ifAlias) reach
+    // the DOM here, so everything is escaped before insertion.
+    dmEsc(v) {
+        return String(v == null ? '' : v).replace(/[&<>"']/g,
+            c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    },
+
+    dmUptime(ticks) {
+        // sysUpTime is in hundredths of a second.
+        if (ticks == null || ticks === '') return '';
+        const s = Math.floor(Number(ticks) / 100);
+        if (!isFinite(s)) return '';
+        const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+        return `${d}d ${h}h ${m}m`;
+    },
+
+    // Render rows as a key/value table, skipping blanks so sparse devices
+    // (SSH-only, no ENTITY-MIB) do not show a wall of empty fields.
+    dmKV(pairs) {
+        const rows = pairs
+            .filter(([, v]) => v !== null && v !== undefined && v !== '')
+            .map(([k, v]) => `<tr><td class="dm-key">${this.dmEsc(k)}</td><td>${this.dmEsc(v)}</td></tr>`)
+            .join('');
+        return rows ? `<table class="dm-table">${rows}</table>` : '<div class="dm-empty">No data</div>';
+    },
+
+    dmTable(cols, rows) {
+        if (!rows || !rows.length) return '<div class="dm-empty">No data</div>';
+        const head = cols.map(c => `<th>${this.dmEsc(c.label)}</th>`).join('');
+        const body = rows.map(r =>
+            '<tr>' + cols.map(c => `<td>${this.dmEsc(r[c.key] == null ? '' : r[c.key])}</td>`).join('') + '</tr>'
+        ).join('');
+        return `<table class="dm-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    },
+
+    // Second-pass status per method, as recorded in device.json enrichment.
+    dmCollection(enr) {
+        const ssh = enr.ssh || {}, snmp = enr.snmp || {};
+        const kb = b => (b == null || b === '') ? '' : `${(b / 1024).toFixed(1)} KB`;
+        let html = this.dmKV([['Collected At', enr.collected_at]]);
+        html += '<div class="dm-section">SSH</div>' + this.dmKV([
+            ['Status', ssh.status],
+            ['Credential', ssh.credential],
+            ['Route', ssh.jump_via || (ssh.status === 'ok' ? 'direct' : '')],
+            ['Config', ssh.config_file ? `${ssh.config_file} (${kb(ssh.config_bytes)})` : ''],
+            ['Inventory', ssh.inventory_file ? `${ssh.inventory_file} (${kb(ssh.inventory_bytes)})` : ''],
+            ['Duration (ms)', ssh.duration_ms],
+        ]) + (ssh.errors || []).map(e => `<div class="dm-err">${this.dmEsc(e)}</div>`).join('');
+        html += '<div class="dm-section">SNMP</div>' + this.dmKV([
+            ['Status', snmp.status],
+            ['Credential', snmp.credential],
+            ['Collected', (snmp.collected || []).join(', ')],
+            ['Still Missing', (snmp.missing || []).join(', ')],
+            ['Note', snmp.note],
+        ]) + (snmp.errors || []).map(e => `<div class="dm-err">${this.dmEsc(e)}</div>`).join('');
+        return html;
+    },
+
+    // Fetch config / inventory text through the Python bridge and render it
+    // with a line filter (substring, case-insensitive - an "| include").
+    dmLoadArtifact(pane, deviceDir, kind) {
+        if (!this.bridge || !this.bridge.getDeviceArtifact) {
+            pane.innerHTML = '<div class="dm-empty">Available in the application only - ' +
+                             `${this.dmEsc(kind)}.txt is in the device folder.</div>`;
+            return;
+        }
+        this.bridge.getDeviceArtifact(deviceDir, kind, (resJson) => {
+            let res;
+            try { res = JSON.parse(resJson); } catch (e) { res = { ok: false, error: String(e) }; }
+            if (!res.ok) {
+                pane.innerHTML = `<div class="dm-err">${this.dmEsc(res.error || 'Not available')}</div>`;
+                return;
+            }
+            const lines = (res.text || '').replace(/\r\n?/g, '\n').split('\n');
+            pane.innerHTML =
+                `<input class="dm-filter dm-linefilter" placeholder="Filter lines (like | include)...">` +
+                '<pre class="dm-pre"></pre>' +
+                `<div class="dm-meta"></div>`;
+            const pre = pane.querySelector('.dm-pre');
+            const meta = pane.querySelector('.dm-meta');
+            const render = (q) => {
+                const shown = q ? lines.filter(l => l.toLowerCase().includes(q)) : lines;
+                pre.textContent = shown.join('\n');
+                meta.textContent = (q ? `${shown.length} of ${lines.length} lines` : `${lines.length} lines`) +
+                    (res.truncated ? '  -  truncated (file larger than 8 MB)' : '') +
+                    (res.path ? `  -  ${res.path}` : '');
+            };
+            render('');
+            pane.querySelector('.dm-linefilter').oninput = (ev) => render(ev.target.value.toLowerCase());
+        });
+    },
+
+    showNodeInfo(data) {
+        const m = data.metadata || {};
+        const counts = m.counts || {};
+
+        document.getElementById('dm-title').textContent = data.label || data.id;
+        document.getElementById('dm-sub').textContent =
+            [data.ip, data.platform].filter(Boolean).join('  •  ');
+
+        const ifaces = m.interfaces || [];
+        const neighbors = m.neighbors || [];
+        const arp = m.arp_table || {};
+        const arpRows = Object.keys(arp).map(mac => ({ mac: mac, ip: arp[mac] }));
+        const chassis = m.chassis || [];
+        const enr = m.enrichment || {};
+        const ssh = enr.ssh || {};
+
+        const panes = [
+            { id: 'overview', label: 'Overview', html: this.dmKV([
+                ['Name', data.id || data.label],
+                ['sysName', m.sys_name],
+                ['FQDN', m.fqdn],
+                ['IP', data.ip],
+                ['RSTP', m.stp ? textoStp(m.stp) + (m.stp.root ? ' · ROOT' + (m.stp.seguidores ? ' (' + m.stp.seguidores +
+                    ' equipos lo informan como root)' : '') : '') : ''],
+                ['Bridge ID', m.stp && m.stp.id ? m.stp.id.slice(0, 4).toUpperCase() + '.' +
+                    m.stp.id.slice(4).toUpperCase().match(/../g).join(':') : ''],
+                ['Root bridge', m.stp && m.stp.root_id && !m.stp.root ? (m.stp.root_nombre || 'fuera de este mapa') + ' — ' +
+                    m.stp.root_id.slice(0, 4).toUpperCase() + '.' + m.stp.root_id.slice(4).toUpperCase().match(/../g).join(':') : ''],
+                ['Puerto hacia el root', m.stp && !m.stp.root ? m.stp.puerto_root : ''],
+                ['Costo al root', m.stp && !m.stp.root && m.stp.costo_root && m.stp.costo_root !== '0' ? m.stp.costo_root : ''],
+                ['Marca', m.marca || data.vendor],
+                ['MAC', m.mac && m.mac !== '-' ? m.mac : m.mac_base],
+                ['Marca según', m.marca_segun],
+                ['Estado', m.estado],
+                ['IP según', m.ip_segun],
+                ['⚠ IP duplicada', m.ip_duplicada],
+                ['Enlaces', m.enlaces],
+                ['VLANs en sus enlaces', this.cy ? [...new Set(this.cy.getElementById(data.id).connectedEdges()
+                    .map(e => e.data('vlans') || []).flat())].sort((a, b) => a - b).join(', ') : ''],
+                ['VLANs que llegan al equipo', (m.vlans_locales || []).join(', ')],
+                ['Platform', data.platform],
+                ['Location', m.sys_location],
+                ['Contact', m.sys_contact],
+                ['Uptime', this.dmUptime(m.uptime_ticks)],
+                ['Status', data.discovered !== false ? 'Discovered' : 'Undiscovered'],
+                ['sysDescr', m.sys_descr],
+            ])},
+            { id: 'hardware', label: 'Hardware', html: this.dmKV([
+                ['Model', data.model],
+                ['Serial', data.serial],
+                ['OS Version', data.os_version],
+                ['Manufacturer', m.mfg_name],
+                ['Hardware Rev', m.hardware_rev],
+                ['Firmware Rev', m.firmware_rev],
+                ['sysObjectID', m.sys_object_id],
+                ['Inventory Source', m.inventory_source],
+            ]) + (chassis.length ? '<div class="dm-section">Physical entities</div>' + this.dmTable([
+                {key:'class', label:'Class'}, {key:'name', label:'Name'},
+                {key:'model', label:'Model'}, {key:'serial', label:'Serial'},
+                {key:'hardware_rev', label:'HW Rev'}, {key:'firmware_rev', label:'FW Rev'},
+                {key:'software_rev', label:'SW Rev'}, {key:'descr', label:'Description'},
+            ], chassis) : '')},
+            { id: 'discovery', label: 'Discovery', html: this.dmKV([
+                ['Method', m.discovered_via],
+                ['Credential', m.credential_used],
+                ['Discovered At', m.discovered_at],
+                ['Duration (ms)', m.discovery_duration_ms == null ? '' : Math.round(m.discovery_duration_ms)],
+                ['Crawl Depth', m.depth],
+                ['Interfaces', counts.interfaces],
+                ['Neighbors', counts.neighbors],
+                ['ARP Entries', counts.arp_entries],
+            ]) + ((m.discovery_errors && m.discovery_errors.length)
+                ? '<div style="margin-top:10px">' +
+                  m.discovery_errors.map(e => `<div class="dm-err">${this.dmEsc(e)}</div>`).join('') +
+                  '</div>' : '')},
+            { id: 'interfaces', label: 'Interfaces', count: ifaces.length, filter: true, html: this.dmTable([
+                {key:'name', label:'Name'}, {key:'if_index', label:'Index'},
+                {key:'alias', label:'Alias'}, {key:'ip_address', label:'IP'},
+                {key:'mac_address', label:'MAC'}, {key:'speed_mbps', label:'Mbps'},
+                {key:'mtu', label:'MTU'}, {key:'status', label:'Status'},
+            ], ifaces)},
+            { id: 'neighbors', label: 'Neighbors', count: neighbors.length, filter: true, html: this.dmTable([
+                {key:'local_interface', label:'Local If'}, {key:'remote_device', label:'Remote Device'},
+                {key:'remote_interface', label:'Remote If'}, {key:'remote_ip', label:'Remote IP'},
+                {key:'remote_platform', label:'Platform'}, {key:'protocol', label:'Proto'},
+            ], neighbors)},
+            { id: 'arp', label: 'ARP', count: arpRows.length, filter: true, html: this.dmTable([
+                {key:'mac', label:'MAC'}, {key:'ip', label:'IP'},
+            ], arpRows)},
+        ];
+
+        if (m.tipo === 'olt') {
+            const ups = m.uplinks || [];
+            panes.splice(1, 0, { id: 'uplinks', label: 'Uplinks', count: ups.length, html: ups.length
+                ? '<div class="dm-empty" style="text-align:left;padding:0 0 8px">Solo se leen los uplinks de la OLT (sin puertos PON). ' +
+                  'Sus conexiones se cargan a mano en la página Hosts → solapa Enlaces.</div>' + this.dmTable([
+                    {key:'nombre', label:'Puerto'}, {key:'estado', label:'Estado'}, {key:'velocidad', label:'Velocidad'},
+                    {key:'alias', label:'Descripción'}], ups)
+                : '<div class="dm-empty">' + (m.sin_escaneo ? 'Esta OLT se dibuja sin consultarla (sin SNMP).'
+                    : 'No se leyeron uplinks: la OLT no respondió SNMP o no tiene puertos ethernet en su lista de interfaces.') + '</div>' });
+        }
+        if ((m.vlans_puertos || []).length) {
+            const nom = m.vlan_nombres || {};
+            const filas = m.vlans_puertos.map(f => ({ ...f, nombres: (f.vlans || '').split(', ').filter(Boolean)
+                .map(v => nom[v] ? `${v} ${nom[v]}` : '').filter(Boolean).join(', ') }));
+            panes.splice(4, 0, { id: 'vlans', label: 'VLANs', count: filas.length, filter: true, html:
+                '<div class="dm-empty" style="text-align:left;padding:0 0 8px">VLANs vistas = VLANs con MACs aprendidas en el puerto ' +
+                '(Bridge → Hosts) al actualizar el mapa. "bridge" = las que llegan al propio equipo.</div>' + this.dmTable([
+                {key:'puerto', label:'Puerto'}, {key:'pvid', label:'VLAN nativa (PVID)'},
+                {key:'vlans', label:'VLANs vistas'}, {key:'nombres', label:'Nombres'}, {key:'macs', label:'MACs'},
+            ], filas) });
+        }
+
+        // Second-pass (full collection) artifacts, read from the device
+        // folder on demand so map.json stays small.
+        if (ssh.inventory_file) {
+            panes.push({ id: 'inventory', label: 'Inventory', lazy: 'inventory',
+                         html: '<div class="dm-empty">Loading inventory...</div>' });
+        }
+        if (ssh.config_file) {
+            panes.push({ id: 'config', label: 'Config', lazy: 'config',
+                         html: '<div class="dm-empty">Loading config...</div>' });
+        }
+        if (enr.collected_at) {
+            panes.push({ id: 'collection', label: 'Collection', html: this.dmCollection(enr) });
+        }
+
+        const tabs = document.getElementById('dm-tabs');
+        const body = document.getElementById('dm-body');
+        tabs.innerHTML = panes.map((p, i) =>
+            `<button class="dm-tab${i === 0 ? ' active' : ''}" data-pane="${p.id}">${this.dmEsc(p.label)}` +
+            (p.count !== undefined ? ` <span class="dm-count">${p.count}</span>` : '') + `</button>`
+        ).join('');
+        body.innerHTML = panes.map((p, i) =>
+            `<div class="dm-pane${i === 0 ? ' active' : ''}" data-pane="${p.id}"` +
+            (p.lazy ? ` data-lazy="${p.lazy}"` : '') + '>' +
+            (p.filter && p.count ? `<input class="dm-filter" data-for="${p.id}" placeholder="Filter ${this.dmEsc(p.label.toLowerCase())}...">` : '') +
+            p.html + '</div>'
+        ).join('');
+
+        tabs.querySelectorAll('.dm-tab').forEach(btn => {
+            btn.onclick = () => {
+                tabs.querySelectorAll('.dm-tab').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                body.querySelectorAll('.dm-pane').forEach(p =>
+                    p.classList.toggle('active', p.dataset.pane === btn.dataset.pane));
+                const pane = body.querySelector(`.dm-pane[data-pane="${btn.dataset.pane}"]`);
+                if (pane && pane.dataset.lazy && !pane.dataset.loaded) {
+                    pane.dataset.loaded = '1';
+                    this.dmLoadArtifact(pane, m.device_dir || '', pane.dataset.lazy);
+                }
+            };
+        });
+
+        // Client-side row filter - substring match across the whole row.
+        body.querySelectorAll('.dm-filter').forEach(inp => {
+            inp.oninput = () => {
+                const q = inp.value.toLowerCase();
+                const pane = body.querySelector(`.dm-pane[data-pane="${inp.dataset.for}"]`);
+                pane.querySelectorAll('tbody tr').forEach(tr => {
+                    tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+                });
+            };
+        });
+
+        document.getElementById('device-modal').classList.add('active');
+    },
+
+    hideNodeInfo() {
+        document.getElementById('device-modal').classList.remove('active');
+    },
+
+    showEdgeInfo(data) {
+        const panel = document.getElementById('info-panel');
+        const content = document.getElementById('info-content');
+        const interfaces = (data.label || 'N/A').replace(/\n/g, '<br>');
+        const count = data.connectionCount || '';
+        const countStr = count > 1 ? ` (${count} links)` : '';
+        content.innerHTML = `
+            <div class="info-item"><strong>Source:</strong> ${data.source}</div>
+            <div class="info-item"><strong>Target:</strong> ${data.target}</div>
+            <div class="info-item"><strong>Interfaces${countStr}:</strong><br>${interfaces}</div>
+        `;
+        panel.querySelector('h4').textContent = 'Connection Information';
+        panel.classList.add('active');
+    },
+
+    hideInfoPanel() {
+        document.getElementById('info-panel').classList.remove('active');
+    },
+
+    updateStats() {
+        document.getElementById('node-count').textContent = this.cy.nodes().length;
+        document.getElementById('edge-count').textContent = this.cy.edges().length;
+    },
+
+    exportPositions() {
+        const positions = {};
+        this.cy.nodes().forEach(node => {
+            const pos = node.position();
+            positions[node.id()] = { x: pos.x, y: pos.y };
+        });
+        return JSON.stringify(positions);
+    },
+
+    restorePositions(positionsJson) {
+        try {
+            const positions = JSON.parse(positionsJson);
+            this.cy.nodes().forEach(node => {
+                const pos = positions[node.id()];
+                if (pos) node.position(pos);
+            });
+            this.cy.fit(null, 30);
+        } catch (e) {
+            DebugLog.error('restorePositions error: ' + e.message);
+        }
+    },
+
+    setTheme(themeJson) {
+        try {
+            const theme = JSON.parse(themeJson);
+            const root = document.documentElement;
+            for (const [key, value] of Object.entries(theme)) {
+                root.style.setProperty(key, value);
+            }
+            if (this.cy) this.cy.style(this.getStyles());
+            document.body.style.background = theme['--bg-primary'] || '#1a1a2e';
+        } catch (e) {
+            DebugLog.error('setTheme error: ' + e.message);
+        }
+    },
+
+    showControls(show = true) {
+        document.getElementById('controls').classList.toggle('hidden', !show);
+    },
+
+    showLoading() {
+        document.getElementById('loading').classList.remove('hidden');
+    },
+
+    hideLoading() {
+        document.getElementById('loading').classList.add('hidden');
+    },
+
+    exportPNG() {
+    if (!this.cy) return null;
+    const bg = fondoBlanco ? '#ffffff' : (getComputedStyle(document.documentElement).getPropertyValue('--bg-primary').trim() || '#1a1a2e');
+    return this.cy.png({ output: 'base64', bg: bg, full: true, scale: 2 });
+},
+
+getSelectedNodes() {
+    if (!this.cy) return '[]';
+    return JSON.stringify(this.cy.nodes(':selected').map(n => n.id()));
+}
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    TopologyViewer.init();
+});
+
+window.TopologyViewer = TopologyViewer;
+window.DebugLog = DebugLog;
+</script>
+<style>
+  #leyenda { position: fixed; right: 12px; bottom: 12px; z-index: 20; background: rgba(28,31,38,.92);
+             border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px 12px; font: 12px/1.6 system-ui, sans-serif;
+             color: #e6e8eb; }
+  #leyenda b { display: block; font-size: 11px; color: #8b93a1; text-transform: uppercase; letter-spacing: .04em; margin-top: 4px; }
+  #leyenda i { display: inline-block; width: 26px; height: 0; vertical-align: middle; margin-right: 8px; }
+  #leyenda span.c { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: middle; margin-right: 8px; }
+  @media (max-width: 600px) { #leyenda { display: none; } }
+  .cfg-form { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; align-items: center; margin-top: 14px;
+              font-size: 12px; }
+  .cfg-form label { color: var(--text-secondary, #8b93a1); }
+  .cfg-form input, .cfg-form select { background: #0f1115; color: var(--text-primary, #e6e8eb); border: 1px solid #2a2f3a;
+              border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%; box-sizing: border-box; }
+  .cfg-form input[readonly] { opacity: .7; }
+  .cfg-acciones { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+  .cfg-btn { background: #3b82f6; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; font: inherit;
+             font-weight: 600; cursor: pointer; }
+  .cfg-btn.sec { background: #2a2f3a; color: var(--text-primary, #e6e8eb); font-weight: 500; }
+  .cfg-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .cfg-msg { font-size: 12px; }
+  .cfg-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .cfg-mini { background: none; border: 1px solid #2a2f3a; color: inherit; border-radius: 4px; padding: 1px 8px;
+              margin-left: 8px; cursor: pointer; font-size: 11px; }
+  @media (max-width: 600px) { .cfg-form { grid-template-columns: 1fr; } }
+</style>
+<div id="panel-vlan" hidden>
+  <div class="pv-tit"><b id="pv-titulo"></b><button type="button" onclick="elegirVlan('')" title="Quitar el filtro de VLAN" aria-label="Quitar el filtro de VLAN">&times;</button></div>
+  <div class="pv-sub" id="pv-resumen"></div>
+  <div class="pv-ops">
+    <label class="pv-chk"><input type="checkbox" id="vl-puertos" onchange="opcionesVlan()"> Ver por qué puertos pasa (continuidad)</label>
+    <label class="pv-chk"><input type="checkbox" id="vl-sin-directo" onchange="opcionesVlan()"> Ocultar equipos sin cable directo (entrecortados)</label>
+    <label class="pv-chk"><input type="checkbox" id="vl-sin-vlan" onchange="opcionesVlan()"> Ocultar equipos que no tienen la VLAN</label>
+  </div>
+  <div id="vl-recorrido"></div>
+  <label>Desde <select id="vl-desde" onchange="trazarCamino()"></select></label>
+  <label>Hasta <select id="vl-hasta" onchange="trazarCamino()"></select></label>
+  <div id="vl-ruta"></div>
+  <div class="pv-nota">Verde: enlaces donde se vio la VLAN (Bridge → Hosts) o es la nativa del puerto.
+    Verde punteado: detrás de un equipo sin datos de VLAN (probable). Verde entrecortado: tiene la VLAN pero no es
+    cable directo (se ve por VLAN, túnel o a través de otro switch). Amarillo: camino; naranja: camino alternativo.</div>
+</div>
+<style>
+  #panel-vlan { position: fixed; left: 12px; top: 64px; z-index: 900; width: 340px; max-width: calc(100% - 24px);
+                max-height: calc(100vh - 140px); overflow: auto; box-sizing: border-box; background: rgba(28,31,38,.95);
+                border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px 12px; font: 12px/1.5 system-ui, sans-serif; color: #e6e8eb; }
+  #panel-vlan .pv-tit { display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
+  #panel-vlan .pv-tit button { background: none; border: 0; color: #8b93a1; font-size: 20px; cursor: pointer; line-height: 1; }
+  #panel-vlan .pv-sub, #panel-vlan .pv-nota { color: #8b93a1; margin: 2px 0 8px; }
+  #panel-vlan .pv-nota { margin: 8px 0 0; font-size: 11px; }
+  #panel-vlan label { display: grid; grid-template-columns: 48px 1fr; align-items: center; gap: 6px; margin: 4px 0; }
+  #panel-vlan select { background: #0f1115; color: #e6e8eb; border: 1px solid #2a2f3a; border-radius: 6px; padding: 5px 6px;
+                       font: inherit; min-width: 0; }
+  #panel-vlan label.pv-chk { display: flex; grid-template-columns: none; gap: 8px; align-items: flex-start; margin: 5px 0; cursor: pointer; }
+  #panel-vlan label.pv-chk input { margin-top: 2px; accent-color: #22c55e; }
+  #panel-vlan .pv-ops { border-top: 1px solid #2a2f3a; border-bottom: 1px solid #2a2f3a; padding: 4px 0; margin: 6px 0 8px; }
+  #vl-recorrido { margin: 0 0 8px; }
+  #vl-recorrido ol { margin: 6px 0 0; padding-left: 20px; max-height: 260px; overflow: auto; }
+  #vl-recorrido li { margin: 3px 0; }
+  #vl-recorrido .p { font-family: ui-monospace, Consolas, monospace; color: #4ade80; }
+  #vl-recorrido i { color: #8b93a1; }
+  #vl-ruta ol { margin: 8px 0 0; padding-left: 20px; }
+  #vl-ruta li { margin: 3px 0; }
+  #vl-ruta .p { font-family: ui-monospace, Consolas, monospace; color: #facc15; }
+  #vl-ruta .alt .p { color: #fb923c; }
+  #vl-ruta .aviso { color: #f59e0b; margin-top: 8px; }
+  @media (max-width: 600px) { #panel-vlan { top: auto; bottom: 40px; max-height: 45vh; } }
+</style>
+<div id="leyenda">
+  <b>Equipos</b>
+  <div><span class="c" style="background:#2563eb"></span>Router</div>
+  <div><span class="c" style="background:#0d9488"></span>Switch de distribución</div>
+  <div><span class="c" style="background:#475569"></span>Switch de acceso</div>
+  <div><span class="c" style="background:#c2410c"></span>Antena (Ubiquiti / Mimosa)</div>
+  <div><span class="c" style="background:#7e22ce"></span>Servidor (SUPERMICRO / HP / VMware)</div>
+  <div><span class="c" style="background:#be185d"></span>OLT (enlaces manuales)</div>
+  <b>Estado</b>
+  <div><span class="c" style="border:2px solid #22c55e"></span>Responde SNMP</div>
+  <div><span class="c" style="border:2px solid #f59e0b"></span>Sin SNMP (ubicado por ARP)</div>
+  <div><span class="c" style="border:2px solid #3b82f6"></span>Agregado automático (LLDP/CDP + ARP / IP neighbor)</div>
+  <div><span class="c" style="border:2px solid #d946ef"></span>⚠ IP duplicada</div>
+  <div><span class="c" style="border:2px dashed #ef4444"></span>Sin IP / sin respuesta</div>
+  <div><span class="c" style="border:3px double #94a3b8"></span>Solo dibujado (no se escanea)</div>
+  <div><span class="c" style="background:#facc15;opacity:.7;box-shadow:0 0 0 3px rgba(250,204,21,.35)"></span>ROOT de RSTP</div>
+  <b>Enlaces</b>
+  <div><i style="border-top:2px solid #94a3b8"></i>Activo</div>
+  <div><i style="border-top:2px dashed #f59e0b"></i>Respaldo RSTP</div>
+  <div><i style="border-top:2px solid #a78bfa"></i>Enlace manual</div>
+  <div><i style="border-top:2px dashed #a78bfa"></i>Enlace manual de respaldo</div>
+  <b>VLAN elegida</b>
+  <div><i style="border-top:3px solid #22c55e"></i>Pasa la VLAN</div>
+  <div><i style="border-top:2px dashed #22c55e"></i>Con la VLAN, sin cable directo</div>
+  <div><i style="border-top:4px solid #facc15"></i>Camino trazado</div>
+</div>
+<script>
+// ===== Capa "ordenado": roles, iconos SVG, layout por niveles y etiquetas bajo demanda =====
+const ICONOS = (() => {
+    const svg = s => 'data:image/svg+xml,' + encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">${s}</svg>`);
+    const flecha = (x1, y1, x2, y2) => `<path d="M${x1} ${y1}L${x2} ${y2}"/>`;
+    return {
+        router: svg(`<circle cx="32" cy="32" r="22"/>` +
+            flecha(32, 12, 32, 26) + `<path d="M27 17l5-5 5 5"/>` +
+            flecha(32, 52, 32, 38) + `<path d="M27 47l5 5 5-5"/>` +
+            flecha(12, 32, 26, 32) + `<path d="M21 27l5 5-5 5"/>` +
+            flecha(52, 32, 38, 32) + `<path d="M43 27l-5 5 5 5"/>`),
+        distribucion: svg(`<rect x="8" y="18" width="48" height="28" rx="4"/>` +
+            `<path d="M16 27h26M36 22l6 5-6 5"/><path d="M48 37H22M28 32l-6 5 6 5"/>`),
+        acceso: svg(`<rect x="4" y="17" width="56" height="30" rx="4"/>` +
+            [10, 19, 28, 37].map(x => `<rect x="${x}" y="25" width="7" height="8" rx="1" fill="#fff" stroke="none"/>`).join('') +
+            [10, 19, 28, 37].map(x => `<rect x="${x}" y="36" width="7" height="5" rx="1" fill="#fff" stroke="none" opacity=".55"/>`).join('') +
+            `<circle cx="51" cy="29" r="3" fill="#22c55e" stroke="none"/><circle cx="51" cy="38" r="3" fill="#fff" stroke="none"/>`),
+        externo: svg(`<rect x="10" y="16" width="44" height="32" rx="6" stroke-dasharray="5 4"/><path d="M27 27a5 5 0 1 1 7 4.6c-1.3.6-2 1.6-2 3V36"/><circle cx="32" cy="41" r="1.2" fill="#fff"/>`),
+        // antena (radioenlaces Ubiquiti / Mimosa): mastil con ondas
+        antena: svg(`<circle cx="32" cy="24" r="3" fill="#fff" stroke="none"/>` +
+            `<path d="M32 28L23 56M32 28l9 28M26.5 45h11"/>` +
+            `<path d="M26.3 18.3a8 8 0 0 0 0 11.4M37.7 18.3a8 8 0 0 1 0 11.4"/>` +
+            `<path d="M22.1 14.1a14 14 0 0 0 0 19.8M41.9 14.1a14 14 0 0 1 0 19.8"/>`),
+        // OLT: chasis con puertos y fibra que se reparte (splitter)
+        olt: svg(`<rect x="6" y="12" width="52" height="16" rx="3"/>` +
+            [12, 20, 28].map(x => `<rect x="${x}" y="17" width="5" height="6" rx="1" fill="#fff" stroke="none"/>`).join('') +
+            `<circle cx="50" cy="20" r="2.5" fill="#22c55e" stroke="none"/>` +
+            `<path d="M32 28v8M32 36L16 50M32 36v14M32 36l16 14"/>` +
+            [16, 32, 48].map(x => `<circle cx="${x}" cy="52" r="3" fill="#fff" stroke="none"/>`).join('')),
+        // servidor (SUPERMICRO / HP): tres unidades de rack
+        servidor: svg([10, 25, 40].map(y => `<rect x="12" y="${y}" width="40" height="12" rx="2"/>` +
+            `<path d="M18 ${y + 6}h14"/><circle cx="45" cy="${y + 6}" r="1.8" fill="#22c55e" stroke="none"/>`).join(''))
+    };
+})();
+const COLOR_ROL = { router: '#2563eb', distribucion: '#0d9488', acceso: '#475569', externo: '#3f3f46', antena: '#c2410c', servidor: '#7e22ce', olt: '#be185d' };
+
+// Ubiquiti / Mimosa = radioenlace: se dibuja con antena (salvo sus switches/routers EdgeSwitch, EdgeRouter, UniFi Switch)
+function esAntena(n) {
+    const d = n.data(), m = d.metadata || {};
+    const txt = [d.vendor, m.marca, m.mfg_name, d.platform, d.model, m.sys_descr, d.id, d.label].filter(Boolean).join(' ');
+    const oid = String(m.sys_object_id || '');
+    const marca = /ubiquiti|\bubnt\b|mimosa|airos|airmax|airfiber|litebeam|nanobeam|powerbeam|nanostation|\bLTU\b/i.test(txt) ||
+                  /^\.?1\.3\.6\.1\.4\.1\.(41112|10002|43356)\b/.test(oid);
+    return marca && !/edge\s?switch|edge\s?router|\bUSW\b|unifi\s?switch|\bER-\d/i.test(txt);
+}
+// SUPERMICRO / HP = servidor (salvo los switches HP / Aruba: OfficeConnect, ProCurve, "Switch"...)
+function esServidor(n) {
+    const d = n.data(), m = d.metadata || {};
+    const txt = [d.vendor, m.marca, m.mfg_name, d.platform, d.model, m.sys_descr, d.id, d.label].filter(Boolean).join(' ');
+    const marca = /supermicro|super\s?micro|\bHPE?\b|hewlett|proliant|vmware|esxi|vcenter|vsphere/i.test(txt);
+    return marca && !(['switch', 'router'].includes(m.tipo) && m.fijo) &&
+           !/switch|officeconnect|procurve|aruba|comware|\bSW\b/i.test(txt);
+}
+
+function rolDe(n) {
+    const d = n.data(), p = (d.platform || '') + ' ' + (d.label || '');
+    if ((d.metadata || {}).tipo === 'olt') return 'olt';
+    if (!d.discovered) return 'externo';
+    const t = (d.metadata || {}).fijo ? (d.metadata || {}).tipo : '';
+    if (t === 'router') return 'router';
+    if (t === 'switch') return 'distribucion';
+    if (((d.metadata || {}).estado || '').startsWith('auto')) {
+        // Vecino agregado automaticamente: el icono sale de lo que anuncia por LLDP/CDP
+        if (/RouterOS/i.test(p) && /CRS|SW[ _-]/i.test(p)) return 'distribucion';
+        if (/RouterOS|CCR|RB\d|router/i.test(p)) return 'router';
+        return 'acceso';
+    }
+    if (/DH-HS|TABLERO|Sin SNMP|Sin respuesta|Sin IP/i.test(p)) return 'acceso';
+    if (/RouterOS\s+CRS|SW-SFP|switch/i.test(p)) return 'distribucion';
+    if (/RouterOS|router|CCR|RB\d/i.test(p)) return 'router';
+    return 'acceso';
+}
+function estadoDe(n) {
+    const e = ((n.data('metadata') || {}).estado || '').toLowerCase();
+    if (!n.data('discovered')) return 'externo';
+    if ((n.data('metadata') || {}).ip_duplicada) return 'duplicada';
+    if ((n.data('metadata') || {}).sin_escaneo) return 'dibujado';
+    if (e.startsWith('auto')) return 'auto';
+    if (e.includes('sin arp') || e.includes('lldp sin') || /^Sin respuesta/.test(n.data('platform'))) return 'caido';
+    if (e.includes('sin snmp')) return 'sinsnmp';
+    return 'ok';
+}
+// ---- Menu "Tipos": ocultar equipos por tipo (preferencia de este navegador para cada mapa) ----
+const TIPOS_VISIBLES = [
+    ['router', 'Router', '#2563eb'], ['distribucion', 'Switch', '#0d9488'], ['acceso', 'Switch de acceso', '#475569'], ['olt', 'OLT', '#be185d'],
+    ['antena', 'Antenas', '#c2410c'], ['servidor', 'Servidores', '#7e22ce'], ['externo', 'Otros / externos', '#3f3f46']];
+let tiposOcultos = new Set();
+try { tiposOcultos = new Set(JSON.parse(localStorage.getItem('mapa-tipos-ocultos-' + new URLSearchParams(location.search).get('map')) || '[]')); } catch (e) {}
+function tipoVisible(n) { return n.data('antena') ? 'antena' : n.data('servidor') ? 'servidor' : (n.data('rol') || 'acceso'); }
+function aplicarTipos() {
+    const cy = TopologyViewer.cy;
+    if (!cy) return;
+    cy.batch(() => cy.nodes().forEach(n => n.toggleClass('tipo-oculto', tiposOcultos.has(tipoVisible(n)))));
+    try { localStorage.setItem('mapa-tipos-ocultos-' + nombreMapa, JSON.stringify([...tiposOcultos])); } catch (e) {}
+    const b = document.getElementById('btn-tipos');
+    b.classList.toggle('activo', tiposOcultos.size > 0);
+    b.innerHTML = 'Tipos' + (tiposOcultos.size ? ' (' + tiposOcultos.size + ' oculto' + (tiposOcultos.size > 1 ? 's' : '') + ')' : '') + ' &#9662;';
+    pintarPanelTipos();
+}
+function pintarPanelTipos() {
+    const cy = TopologyViewer.cy, p = document.getElementById('panel-tipos');
+    const cuenta = {};
+    if (cy) cy.nodes().forEach(n => { const t = tipoVisible(n); cuenta[t] = (cuenta[t] || 0) + 1; });
+    p.innerHTML = TIPOS_VISIBLES.filter(([t]) => cuenta[t] || tiposOcultos.has(t)).map(([t, nom, c]) =>
+        `<label><input type="checkbox" ${tiposOcultos.has(t) ? '' : 'checked'} onchange="cambiarTipo('${t}', this.checked)">` +
+        `<span class="pt-c" style="background:${c}"></span>${nom}<span class="pt-n">${cuenta[t] || 0}</span></label>`).join('') +
+        `<div class="pt-pie"><button class="ctrl-btn" onclick="todosTipos(true)">Mostrar todos</button></div>`;
+}
+function cambiarTipo(t, visible) { if (visible) tiposOcultos.delete(t); else tiposOcultos.add(t); aplicarTipos(); }
+function todosTipos(visible) { tiposOcultos = visible ? new Set() : new Set(TIPOS_VISIBLES.map(x => x[0])); aplicarTipos(); }
+function alternarPanelTipos(ev) {
+    ev.stopPropagation();
+    const p = document.getElementById('panel-tipos'), abrir = p.hidden;
+    if (abrir) pintarPanelTipos();
+    p.hidden = !abrir;
+    document.getElementById('btn-tipos').setAttribute('aria-expanded', String(abrir));
+}
+document.addEventListener('click', e => {
+    const m = document.getElementById('menu-tipos'), p = document.getElementById('panel-tipos');
+    if (p && !p.hidden && !m.contains(e.target)) { p.hidden = true; document.getElementById('btn-tipos').setAttribute('aria-expanded', 'false'); }
+});
+document.addEventListener('keydown', e => {
+    const p = document.getElementById('panel-tipos');
+    if (e.key === 'Escape' && p && !p.hidden) { p.hidden = true; document.getElementById('btn-tipos').setAttribute('aria-expanded', 'false'); }
+});
+
+// ---- Menu "Datos": que se ve debajo de cada equipo (preferencia de este navegador para cada mapa) ----
+const DATOS_VISIBLES = [['ip', 'IP', '10.0.0.1'], ['rstp', 'RSTP', 'RSTP 5000 hex'], ['marca', 'Marca', 'MIKROTIK']];
+let datosOcultos = new Set();
+try { datosOcultos = new Set(JSON.parse(localStorage.getItem('mapa-datos-ocultos-' + new URLSearchParams(location.search).get('map')) || '[]')); } catch (e) {}
+// "RSTP 5000 hex": protocolo y prioridad del bridge en hex (el port cost mode no llega por SNMP en RouterOS)
+function textoStp(s) { return (s.modo || 'STP') + ' ' + (s.prioridad || '?') + ' hex'; }
+function etiquetaNodo(n) {
+    const l = [];
+    if (n.data('stpRoot')) l.push('ROOT');
+    l.push(n.data('nombreCorto') || n.id());
+    if (!datosOcultos.has('ip') && n.data('ip')) l.push(n.data('ip'));
+    if (!datosOcultos.has('rstp') && n.data('stpTxt')) l.push(n.data('stpTxt'));
+    if (!datosOcultos.has('marca') && n.data('vendor')) l.push('Marca: ' + n.data('vendor'));
+    return l.join('\n');
+}
+function aplicarDatos() {
+    const cy = TopologyViewer.cy;
+    if (!cy) return;
+    cy.batch(() => cy.nodes().forEach(n => { if (n.data('nombreCorto') !== undefined) n.data('label', etiquetaNodo(n)); }));
+    try { localStorage.setItem('mapa-datos-ocultos-' + nombreMapa, JSON.stringify([...datosOcultos])); } catch (e) {}
+    const b = document.getElementById('btn-datos');
+    b.classList.toggle('activo', datosOcultos.size > 0);
+    b.innerHTML = 'Datos' + (datosOcultos.size ? ' (' + datosOcultos.size + ' oculto' + (datosOcultos.size > 1 ? 's' : '') + ')' : '') + ' &#9662;';
+    pintarPanelDatos();
+}
+function pintarPanelDatos() {
+    document.getElementById('panel-datos').innerHTML = DATOS_VISIBLES.map(([d, nom, ej]) =>
+        `<label><input type="checkbox" ${datosOcultos.has(d) ? '' : 'checked'} onchange="cambiarDato('${d}', this.checked)">` +
+        `${nom}<span class="pt-ej">${ej}</span></label>`).join('') +
+        `<div class="pt-pie"><button class="ctrl-btn" onclick="todosDatos(true)">Ver todos</button>` +
+        `<button class="ctrl-btn" onclick="todosDatos(false)">Solo nombre</button></div>`;
+}
+function cambiarDato(d, visible) { if (visible) datosOcultos.delete(d); else datosOcultos.add(d); aplicarDatos(); }
+function todosDatos(visible) { datosOcultos = visible ? new Set() : new Set(DATOS_VISIBLES.map(x => x[0])); aplicarDatos(); }
+function alternarPanelDatos(ev) {
+    ev.stopPropagation();
+    const p = document.getElementById('panel-datos'), abrir = p.hidden;
+    if (abrir) pintarPanelDatos();
+    p.hidden = !abrir;
+    document.getElementById('btn-datos').setAttribute('aria-expanded', String(abrir));
+}
+document.addEventListener('click', e => {
+    const m = document.getElementById('menu-datos'), p = document.getElementById('panel-datos');
+    if (p && !p.hidden && !m.contains(e.target)) { p.hidden = true; document.getElementById('btn-datos').setAttribute('aria-expanded', 'false'); }
+});
+document.addEventListener('keydown', e => {
+    const p = document.getElementById('panel-datos');
+    if (e.key === 'Escape' && p && !p.hidden) { p.hidden = true; document.getElementById('btn-datos').setAttribute('aria-expanded', 'false'); }
+});
+
+// ---- Etiqueta de VLANs de un enlace: rangos (100-116) y, si son muchas, filas ordenadas ----
+const VLAN_EN_LINEA = 6, VLAN_POR_FILA = 8;
+function rangosVlan(vls) {
+    const nums = vls.filter(v => /^\d+$/.test(v)).map(Number).sort((a, b) => a - b), otras = vls.filter(v => !/^\d+$/.test(v));
+    const res = [];
+    for (let i = 0; i < nums.length; i++) {
+        let j = i;
+        while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++;
+        if (j - i >= 2) res.push(nums[i] + '-' + nums[j]);
+        else for (let k = i; k <= j; k++) res.push(String(nums[k]));
+        i = j;
+    }
+    return res.concat(otras);
+}
+function textoVlans(vls) {
+    const r = rangosVlan(vls);
+    if (r.length <= VLAN_EN_LINEA) return 'VLAN ' + r.join(', ');
+    const filas = [];
+    for (let i = 0; i < r.length; i += VLAN_POR_FILA) filas.push(r.slice(i, i + VLAN_POR_FILA).join(', '));
+    return 'VLANs (' + vls.length + '):\n' + filas.join('\n');
+}
+
+function decorar(cy) {
+    cy.batch(() => cy.nodes().forEach(n => {
+        const rol = rolDe(n);
+        n.data('rol', rol);
+        n.data('estado', estadoDe(n));
+        const antena = rol !== 'olt' && esAntena(n), servidor = rol !== 'olt' && !antena && esServidor(n);
+        const dibujo = antena ? 'antena' : servidor ? 'servidor' : rol;
+        n.data('antena', antena);
+        n.data('servidor', servidor);
+        n.data('icon', ICONOS[dibujo]);
+        n.data('vendorFill', COLOR_ROL[dibujo]);
+        // Etiquetas cortas: sin el prefijo de sitio "S008 - " / "S008-SW_" (el nombre completo queda en el id)
+        // "S008-SW_TABLERO_001" -> "TABLERO_001"; "S008 - SW-SFP-001" -> "SW-SFP-001"; "SW_CAMARAS_RACK" queda igual
+        if (n.data('nombreCorto') === undefined)
+            n.data('nombreCorto', ((n.data('metadata') || {}).ip_duplicada ? '⚠ ' : '') +
+                                  n.data('label').replace(/^S\d{3}-SW_/, '').replace(/^S\d{3}\s*-\s*/, ''));
+        const stp = (n.data('metadata') || {}).stp;
+        n.data('stpRoot', !!(stp && stp.root));
+        n.data('stpTxt', stp ? textoStp(stp) : '');
+        n.data('label', etiquetaNodo(n));
+    }));
+    cy.style()
+        .selector('node').style({
+            'shape': 'round-rectangle', 'background-color': 'data(vendorFill)', 'background-opacity': 1,
+            'background-image': 'data(icon)', 'background-width': '80%', 'background-height': '80%',
+            'background-fit': 'none', 'background-position-x': '50%', 'background-position-y': '50%',
+            'background-clip': 'node', 'width': 52, 'height': 52, 'border-width': 3, 'border-color': '#22c55e',
+            'border-style': 'solid', 'font-size': '11px', 'text-wrap': 'wrap', 'text-max-width': '120px', 'opacity': 1 })
+        .selector('node[rol = "router"]').style({ 'width': 70, 'height': 70, 'shape': 'ellipse', 'font-size': '13px', 'font-weight': 600 })
+        .selector('node[rol = "distribucion"]').style({ 'width': 64, 'height': 52, 'font-size': '12px', 'font-weight': 600 })
+        .selector('node[rol = "olt"]').style({ 'width': 64, 'height': 52, 'font-size': '12px', 'font-weight': 600 })
+        .selector('node[rol = "acceso"]').style({ 'width': 44, 'height': 44, 'font-size': '10px', 'text-max-width': '84px' })
+        .selector('node[rol = "externo"]').style({ 'width': 40, 'height': 40, 'border-color': '#71717a',
+                                                   'border-style': 'dashed', 'opacity': 0.75, 'font-size': '9px' })
+        .selector('node[estado = "sinsnmp"]').style({ 'border-color': '#f59e0b' })
+        .selector('node[estado = "dibujado"]').style({ 'border-color': '#94a3b8', 'border-style': 'double', 'border-width': 5 })
+        .selector('node[estado = "auto"]').style({ 'border-color': '#3b82f6', 'border-width': 4 })
+        .selector('node[estado = "duplicada"]').style({ 'border-color': '#d946ef', 'border-width': 5,
+                                                         'color': () => fondoBlanco ? '#a21caf' : '#f0abfc' })
+        .selector('node[estado = "caido"]').style({ 'border-color': '#ef4444', 'border-style': 'dashed', 'opacity': 0.8 })
+        .selector('node[?stpRoot]').style({ 'underlay-color': '#facc15', 'underlay-opacity': 0.45, 'underlay-padding': 8,
+                                            'underlay-shape': n => n.data('rol') === 'router' ? 'ellipse' : 'round-rectangle',
+                                            'font-weight': 700 })
+        .selector('node:selected').style({ 'border-width': 5, 'border-color': '#60a5fa' })
+        .selector('edge').style({ 'curve-style': 'straight', 'width': 1.6,
+                                  'line-color': () => fondoBlanco ? '#475569' : '#94a3b8', 'opacity': () => fondoBlanco ? 0.85 : 0.7,
+                                  'label': '', 'font-size': '9px' })
+        .selector('edge[?backup]').style({ 'line-style': 'dashed', 'line-dash-pattern': [5, 5],
+                                           'line-color': '#f59e0b', 'opacity': 0.55 })
+        .selector('edge[?manual]').style({ 'line-color': '#a78bfa', 'opacity': 0.85 })
+        .selector('edge.ver').style({ 'label': 'data(label)', 'opacity': 1, 'width': 2.6, 'z-index': 10 })
+        .selector('node.atenuado, edge.atenuado').style({ 'opacity': 0.12 })
+        .selector('edge[?indirecto]').style({ 'display': 'none' })
+        .selector('edge.ind-ver').style({ 'display': 'element', 'line-style': 'dashed', 'line-dash-pattern': [6, 6],
+                                          'line-color': '#64748b', 'width': 1.4, 'opacity': 0.75 })
+        .selector('.vlan-fuera').style({ 'opacity': 0.08 })
+        .selector('edge.vlan-si').style({ 'line-color': '#22c55e', 'width': 3, 'opacity': 0.95 })
+        .selector('edge.vlan-prob').style({ 'line-color': '#22c55e', 'line-style': 'dotted', 'width': 2, 'opacity': 0.7 })
+        .selector('edge.vlan-ind').style({ 'display': 'element', 'line-style': 'dashed', 'line-dash-pattern': [6, 6],
+                                           'line-color': '#22c55e', 'width': 2, 'opacity': 0.8 })
+        .selector('node.vlan-gw').style({ 'border-color': '#22c55e', 'border-width': 6, 'border-style': 'double' })
+        .selector('edge.vlan-puertos').style({ 'label': 'data(puertosTxt)', 'font-size': '9px', 'text-rotation': 'autorotate',
+                                               'color': () => fondoBlanco ? '#166534' : '#bbf7d0', 'z-index': 12 })
+        .selector('.vlan-oculto').style({ 'display': 'none' })
+        .selector('edge.camino2').style({ 'line-color': '#fb923c', 'width': 4, 'line-style': 'dashed',
+                                          'line-dash-pattern': [8, 5], 'opacity': 1, 'z-index': 15 })
+        .selector('edge.camino').style({ 'line-color': '#facc15', 'width': 5, 'opacity': 1, 'z-index': 20,
+                                         'label': 'data(label)', 'color': () => fondoBlanco ? '#92400e' : '#fde68a' })
+        .selector('node.camino').style({ 'border-color': '#facc15', 'border-width': 6, 'border-style': 'solid' })
+        .update();
+}
+
+// Niveles: externos arriba, router, distribucion, acceso en una fila (orden numerico), sin IP abajo
+function layoutOrdenado(cy) {
+    const visibles = cy.nodes(':visible');
+    const clave = n => n.data('label').replace(/^⚠\s*/, '');
+    const orden = (a, b) => clave(a).localeCompare(clave(b), 'es', { numeric: true });
+    const por = r => visibles.filter(n => n.data('rol') === r).sort(orden);
+    const X = 100, POR_FILA = 24, pos = {};
+    const fila = (nodos, y, sep = X) => {
+        const w = (nodos.length - 1) * sep;
+        nodos.forEach((n, i) => pos[n.id()] = { x: i * sep - w / 2, y });
+    };
+    // Vecinos automaticos: a la fila de acceso si cuelgan solo de switches de distribucion; si no, arriba
+    const esAuto = n => n.data('estado') === 'auto';
+    const colgado = n => n.neighborhood('node').length > 0 &&
+        n.neighborhood('node').every(m => m.data('rol') === 'distribucion' && !esAuto(m));
+    const autoArriba = visibles.filter(n => esAuto(n) && !(n.data('rol') === 'acceso' && colgado(n)));
+    const routers = por('router').not(autoArriba), dist = por('distribucion').union(por('olt')).not(autoArriba).sort(orden);
+    const ext = por('externo').union(autoArriba).sort(orden);
+    const accesoTodos = por('acceso').not(autoArriba);
+    const sinIp = accesoTodos.filter(n => !n.data('ip'));
+    const acceso = accesoTodos.not(sinIp);
+    const ancho = Math.min(POR_FILA, Math.max(acceso.length, 1));
+    let y = 0;
+    if (ext.length) { fila(ext, y, 120); y += 190; }
+    fila(routers, y, 260); y += 190;
+    fila(dist, y, Math.max(420, (ancho - 1) * X * 0.55)); y += 260;
+    for (let i = 0; i < acceso.length; i += POR_FILA) {
+        fila(acceso.slice(i, i + POR_FILA), y, X); y += 170;
+    }
+    if (sinIp.length) fila(sinIp, y + 20, 150);
+    const final = conGuardadas(pos);
+    cy.layout({ name: 'preset', positions: n => final[n.id()] || { x: 0, y: 0 }, fit: true, padding: 40,
+                animate: true, animationDuration: 350 }).run();
+}
+
+// ===== Orden guardado (boton Guardar), seleccion por recuadro y mover varios =====
+let posGuardadas = null;   // {id: [x, y]}
+function conGuardadas(pos) {
+    if (!posGuardadas) return pos;
+    const res = {}, nuevos = [];
+    let maxY = -Infinity, minX = Infinity;
+    for (const [id, xy] of Object.entries(posGuardadas)) { maxY = Math.max(maxY, xy[1]); minX = Math.min(minX, xy[0]); }
+    for (const id of Object.keys(pos)) {
+        const g = posGuardadas[id];
+        if (g) res[id] = { x: g[0], y: g[1] }; else nuevos.push(id);
+    }
+    if (nuevos.length) {
+        // equipos que no estaban al guardar: en filas debajo del orden guardado
+        nuevos.sort((a, b) => pos[a].y - pos[b].y || pos[a].x - pos[b].x);
+        nuevos.forEach((id, i) => res[id] = { x: minX + (i % 16) * 110, y: maxY + 180 + Math.floor(i / 16) * 150 });
+    }
+    return res;
+}
+async function cargarPosiciones() {
+    try {
+        const r = await fetch(BASE_URL + 'admin.php?posiciones=' + encodeURIComponent(nombreMapa), { cache: 'no-store' });
+        const j = await r.json();
+        posGuardadas = j.pos && Object.keys(j.pos).length ? j.pos : null;
+        iniciarGeo(j.fondo);
+    } catch (e) { posGuardadas = null; }
+    const b = document.getElementById('btn-auto');
+    if (b) b.hidden = !posGuardadas;
+}
+function avisar(texto, color) {
+    ponerEstado(texto, color);
+    clearTimeout(avisar._t);
+    avisar._t = setTimeout(() => mostrarUltimaActualizacion().catch(() => {}), 6000);
+}
+async function enviarAdmin(datos) {
+    const tok = await (await fetch(BASE_URL + 'admin.php?token=1', { cache: 'no-store' })).json();
+    const r = await fetch(BASE_URL + 'admin.php', { method: 'POST',
+        body: new URLSearchParams({ csrf: tok.csrf, mapa: nombreMapa, ...datos }) });
+    const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+    if (!j.ok) throw new Error(j.error || 'HTTP ' + r.status);
+    return j;
+}
+async function guardarPosiciones() {
+    const pos = {};
+    TopologyViewer.cy.nodes().forEach(n => {
+        const p = n.position();
+        pos[n.id()] = [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10];
+    });
+    try {
+        ponerEstado('Guardando orden…', '#fbbf24');
+        const j = await enviarAdmin({ accion: 'guardar_posiciones', posiciones: JSON.stringify(pos) });
+        posGuardadas = pos;
+        document.getElementById('btn-auto').hidden = false;
+        avisar(`Orden guardado (${j.n} equipos). "Ordenado" vuelve a este orden.`, '#4ade80');
+    } catch (e) { avisar('No se pudo guardar el orden: ' + e.message, '#f87171'); }
+}
+async function borrarPosiciones() {
+    if (!confirm('¿Volver al orden automático? Se borra el orden guardado de este mapa para todos.')) return;
+    try {
+        await enviarAdmin({ accion: 'borrar_posiciones' });
+        posGuardadas = null;
+        document.getElementById('btn-auto').hidden = true;
+        layoutOrdenado(TopologyViewer.cy);
+        avisar('Orden automático restablecido.', '#4ade80');
+    } catch (e) { avisar('No se pudo borrar el orden guardado: ' + e.message, '#f87171'); }
+}
+// ---- Tamano de los equipos (se ajusta junto con el fondo de mapa) ----
+let tamEquipos = 1;
+const TAM_ROL = { router: [70, 70, 13], distribucion: [64, 52, 12], acceso: [44, 44, 10], externo: [40, 40, 9], olt: [64, 52, 12] };
+const tamDe = n => TAM_ROL[n.data('rol')] || [52, 52, 11];
+function estiloTamano(cy) {
+    cy.style().selector('node').style({
+        'width': n => tamDe(n)[0] * tamEquipos, 'height': n => tamDe(n)[1] * tamEquipos,
+        'font-size': n => Math.max(6, tamDe(n)[2] * Math.sqrt(tamEquipos)),
+        'text-max-width': n => Math.round((n.data('rol') === 'acceso' ? 96 : 150) * Math.max(1, tamEquipos)) + 'px' }).update();
+}
+
+// ---- Fondo de mapa (Leaflet): el punto (0,0) del dibujo es geo.lat/geo.lon y
+//      1 unidad del dibujo = 1 pixel del mapa a zoom geo.z0 ----
+let geo = null, geoMapa = null, geoVisible = false, geoAjustando = false, geoAntes = null;
+// ---- Fondo blanco (preferencia de este navegador para cada mapa; apaga el mapa geografico) ----
+var fondoBlanco = false;
+function prefBlanco(v) {
+    const k = 'mapa-blanco-' + nombreMapa;
+    try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+}
+function aplicarBlanco(si) {
+    fondoBlanco = !!si;
+    document.body.classList.toggle('fondo-blanco', fondoBlanco);
+    document.getElementById('btn-blanco').classList.toggle('activo', fondoBlanco);
+    if (fondoBlanco && geoVisible) { if (geoAjustando) terminarAjusteGeo(false); mostrarGeo(false); prefGeo('0'); }
+    if (TopologyViewer.cy) TopologyViewer.cy.style().update();
+}
+function alternarBlanco() {
+    aplicarBlanco(!fondoBlanco);
+    prefBlanco(fondoBlanco ? '1' : '0');
+}
+function prefGeo(v) {
+    const k = 'mapa-fondo-' + nombreMapa;
+    try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+}
+function iniciarGeo(fondo) {
+    if (!fondo || !fondo.tipo || typeof fondo.lat !== 'number' || typeof L === 'undefined' || !TopologyViewer.cy) {
+        geo = null; document.body.classList.remove('con-geo');
+        document.getElementById('btn-geo').hidden = document.getElementById('btn-geo-ajustar').hidden = true;
+        return;
+    }
+    const cambioTipo = !geo || geo.tipo !== fondo.tipo;
+    geo = { tipo: fondo.tipo, lat: fondo.lat, lon: fondo.lon, z0: +fondo.z0 || 16, tam: +fondo.tam || 1 };
+    tamEquipos = geo.tam; if (TopologyViewer.cy) TopologyViewer.cy.style().update();
+    const el = document.getElementById('geo');
+    if (!geoMapa) {
+        geoMapa = L.map(el, { zoomControl: false, zoomSnap: 0, zoomDelta: 0.5, wheelPxPerZoomLevel: 120,
+            zoomAnimation: false, inertia: false, boxZoom: false, keyboard: false, doubleClickZoom: false,
+            minZoom: 0, maxZoom: 23 });
+        geoMapa.attributionControl.setPrefix(false);
+        L.control.scale({ imperial: false, position: 'bottomright', maxWidth: 160 }).addTo(geoMapa);
+        geoMapa.on('move', () => { if (geoAjustando) recalcularAnclaGeo(); });
+        TopologyViewer.cy.on('viewport', sincronizarGeo);
+        window.addEventListener('resize', () => setTimeout(() => { geoMapa.invalidateSize(false); sincronizarGeo(); }, 50));
+    }
+    if (cambioTipo) {
+        geoMapa.eachLayer(c => geoMapa.removeLayer(c));
+        (geo.tipo === 'satelite'
+            ? L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                { maxNativeZoom: 19, maxZoom: 23, attribution: 'Imágenes &copy; Esri' })
+            : L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                { maxNativeZoom: 19, maxZoom: 23, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>' })
+        ).addTo(geoMapa);
+        el.classList.toggle('geo-oscuro', geo.tipo === 'oscuro');
+    }
+    document.getElementById('btn-geo').hidden = false;
+    mostrarGeo(prefGeo() !== '0' && !fondoBlanco);
+}
+function mostrarGeo(si) {
+    geoVisible = !!si && !!geo;
+    document.body.classList.toggle('con-geo', geoVisible);
+    document.getElementById('btn-geo').classList.toggle('activo', geoVisible);
+    document.getElementById('btn-geo-ajustar').hidden = !geoVisible;
+    if (geoVisible) { geoMapa.invalidateSize(false); sincronizarGeo(); }
+}
+function alternarGeo() {
+    if (geoAjustando) terminarAjusteGeo(false);
+    if (!geoVisible && fondoBlanco) { aplicarBlanco(false); prefBlanco('0'); }
+    mostrarGeo(!geoVisible);
+    prefGeo(geoVisible ? '1' : '0');
+}
+// centro de la pantalla en unidades del dibujo
+function centroDibujo() {
+    const cy = TopologyViewer.cy, z = cy.zoom(), p = cy.pan();
+    return L.point((cy.width() / 2 - p.x) / z, (cy.height() / 2 - p.y) / z);
+}
+function sincronizarGeo() {
+    if (!geoVisible || geoAjustando || !geoMapa) return;
+    const z = TopologyViewer.cy.zoom();
+    const origen = geoMapa.project([geo.lat, geo.lon], geo.z0);
+    const ll = geoMapa.unproject(origen.add(centroDibujo()), geo.z0);
+    geoMapa.setView(ll, geo.z0 + Math.log2(z), { animate: false });
+}
+// con "Ajustar mapa" los equipos quedan quietos y se mueve el fondo: recalcula el ancla
+function recalcularAnclaGeo() {
+    const z = TopologyViewer.cy.zoom();
+    const z0 = geoMapa.getZoom() - Math.log2(z);
+    const origen = geoMapa.project(geoMapa.getCenter(), z0).subtract(centroDibujo());
+    const ll = geoMapa.unproject(origen, z0);
+    geo.lat = ll.lat; geo.lon = ll.lng; geo.z0 = z0;
+    panelAjusteGeo();
+}
+// metros por unidad del dibujo con la escala actual
+function metrosPorUnidad() { return 156543.03392 * Math.cos(geo.lat * Math.PI / 180) / Math.pow(2, geo.z0); }
+function fmtMetros(m) { return m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 0 : 1) + ' km' : Math.round(m) + ' m'; }
+function panelAjusteGeo() {
+    if (!geo) return;
+    const bb = TopologyViewer.cy.nodes().boundingBox(), k = metrosPorUnidad();
+    document.getElementById('ga-escala').value = geo.z0;
+    document.getElementById('ga-escala-v').textContent = TopologyViewer.cy.nodes().length
+        ? `Red ≈ ${fmtMetros(bb.w * k)} × ${fmtMetros(bb.h * k)}` : '';
+    document.getElementById('ga-tam').value = tamEquipos;
+    document.getElementById('ga-tam-v').textContent = Math.round(tamEquipos * 100) + ' %';
+}
+function cambiarEscalaGeo(z0) {
+    z0 = Math.max(12, Math.min(21, z0));
+    // cambia el zoom del fondo alrededor del centro de la pantalla; los equipos no se mueven
+    geoMapa.setZoom(z0 + Math.log2(TopologyViewer.cy.zoom()), { animate: false });
+    recalcularAnclaGeo();
+}
+function pasoEscalaGeo(d) { cambiarEscalaGeo(geo.z0 + d); }
+function cambiarTamGeo(k) {
+    tamEquipos = Math.max(0.3, Math.min(2, Math.round(k * 100) / 100));
+    TopologyViewer.cy.style().update();
+    panelAjusteGeo();
+}
+function pasoTamGeo(d) { cambiarTamGeo(tamEquipos + d); }
+function empezarAjusteGeo() {
+    if (!geoVisible) return;
+    geoAntes = { ...geo, tam: tamEquipos };
+    geoAjustando = true;
+    document.body.classList.add('ajustando-geo');
+    panelAjusteGeo();
+}
+async function terminarAjusteGeo(guardar) {
+    if (!geoAjustando) return;
+    geoAjustando = false;
+    document.body.classList.remove('ajustando-geo');
+    if (!guardar) { geo = geoAntes; cambiarTamGeo(geoAntes.tam); sincronizarGeo(); return; }
+    try {
+        await enviarAdmin({ accion: 'fondo_ajuste', lat: geo.lat.toFixed(7), lon: geo.lon.toFixed(7), z0: geo.z0.toFixed(4),
+                            tam: tamEquipos.toFixed(2) });
+        geo.tam = tamEquipos;
+        avisar('Ajuste del mapa de fondo guardado.', '#4ade80');
+    } catch (e) {
+        geo = geoAntes; cambiarTamGeo(geoAntes.tam);
+        avisar('No se pudo guardar el ajuste: ' + e.message, '#f87171');
+    }
+    sincronizarGeo();
+}
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && geoAjustando) terminarAjusteGeo(false); });
+
+let modoSeleccion = false;
+function alternarSeleccion(forzar) {
+    modoSeleccion = forzar === undefined ? !modoSeleccion : forzar;
+    const cy = TopologyViewer.cy, btn = document.getElementById('btn-seleccionar');
+    cy.userPanningEnabled(!modoSeleccion);     // sin paneo, arrastrar el fondo dibuja el recuadro
+    btn.style.background = modoSeleccion ? 'var(--accent-primary)' : '';
+    btn.style.color = modoSeleccion ? 'var(--bg-primary)' : '';
+    document.getElementById('cy').style.cursor = modoSeleccion ? 'crosshair' : '';
+    if (!modoSeleccion) cy.nodes().unselect();
+}
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && TopologyViewer.cy) TopologyViewer.cy.elements().unselect();
+});
+
+let puertosVisibles = false;
+function alternarEtiquetas() {
+    puertosVisibles = !puertosVisibles;
+    TopologyViewer.cy.edges().toggleClass('ver', puertosVisibles);
+}
+
+let indirectosVisibles = false;
+function alternarIndirectos() {
+    indirectosVisibles = !indirectosVisibles;
+    TopologyViewer.cy.edges('[?indirecto]').toggleClass('ind-ver', indirectosVisibles);
+    document.getElementById('btn-indirectos').style.background = indirectosVisibles ? 'var(--accent-primary)' : '';
+}
+
+// ===== VLANs: selector, recorrido de la VLAN y camino entre dos equipos =====
+const escH = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const nombreCorto = n => n.data('nombreCorto') || (n.data('label') || n.id()).split('\n')[0];
+let vlanActiva = '';
+
+function nombresVlan() {
+    const nom = {};
+    TopologyViewer.cy.nodes().forEach(n => Object.assign(nom, (n.data('metadata') || {}).vlan_nombres || {}));
+    return nom;
+}
+function llenarVlans() {
+    const cy = TopologyViewer.cy, sel = document.getElementById('sel-vlan'), nom = nombresVlan(), cuenta = {};
+    cy.edges().forEach(e => (e.data('vlans') || []).forEach(v => cuenta[v] = (cuenta[v] || 0) + 1));
+    document.getElementById('btn-indirectos').hidden = !cy.edges('[?indirecto]').length;
+    cy.nodes().forEach(n => ((n.data('metadata') || {}).vlans_locales || []).forEach(v => cuenta[v] = cuenta[v] || 0));
+    const ids = Object.keys(cuenta).sort((a, b) => a - b);
+    sel.innerHTML = '<option value="">VLAN: todas</option>' + ids.map(v =>
+        `<option value="${v}">VLAN ${v}${nom[v] ? ' · ' + escH(nom[v]) : ''} (${cuenta[v]} ${cuenta[v] === 1 ? 'enlace' : 'enlaces'})</option>`).join('');
+    sel.hidden = !ids.length;
+    if (!(vlanActiva in cuenta)) vlanActiva = '';
+    sel.value = vlanActiva;
+    aplicarVlan();
+}
+function elegirVlan(v) {
+    vlanActiva = v || '';
+    document.getElementById('sel-vlan').value = vlanActiva;
+    aplicarVlan();
+}
+// Enlaces con la VLAN, mas los enlaces sin datos que cuelgan de equipos sin tabla de VLANs (probables)
+function grafoVlan(v) {
+    const cy = TopologyViewer.cy;
+    const conVlan = cy.edges().filter(e => (e.data('vlans') || []).includes(v));
+    const seguros = conVlan.filter(e => !e.data('indirecto'));
+    const indirectos = conVlan.filter(e => e.data('indirecto'));
+    const gw = cy.nodes().filter(n => ((n.data('metadata') || {}).vlans_locales || []).includes(v));
+    let nodos = seguros.connectedNodes().union(gw);
+    const sinDatos = cy.edges().filter(e => !(e.data('vlans') || []).length && !e.data('indirecto'));
+    let probables = cy.collection();
+    let frontera = nodos.filter(n => !((n.data('metadata') || {}).vlans_puertos || []).length);
+    while (frontera.length) {
+        const nuevos = frontera.connectedEdges().intersection(sinDatos).difference(probables);
+        probables = probables.union(nuevos);
+        const nn = nuevos.connectedNodes().difference(nodos);
+        nodos = nodos.union(nn);
+        frontera = nn.filter(n => !((n.data('metadata') || {}).vlans_puertos || []).length);
+    }
+    const directos = nodos;
+    nodos = nodos.union(indirectos.connectedNodes());
+    // aislados: tienen la VLAN pero ningun cable directo con ella (solo enlaces entrecortados)
+    return { seguros, probables, nodos, gw, indirectos, aislados: nodos.difference(directos) };
+}
+function aplicarVlan() {
+    const cy = TopologyViewer.cy, panel = document.getElementById('panel-vlan');
+    cy.elements().removeClass('vlan-si vlan-prob vlan-gw vlan-ind vlan-fuera vlan-puertos vlan-oculto camino camino2');
+    document.getElementById('vl-recorrido').innerHTML = '';
+    if (!vlanActiva) { panel.hidden = true; return; }
+    const g = grafoVlan(vlanActiva), nom = nombresVlan()[vlanActiva];
+    cy.elements().not(g.nodos.union(g.seguros).union(g.probables).union(g.indirectos)).addClass('vlan-fuera');
+    g.seguros.addClass('vlan-si');
+    g.indirectos.addClass('vlan-ind');
+    g.probables.addClass('vlan-prob');
+    g.gw.addClass('vlan-gw');
+    document.getElementById('pv-titulo').textContent = 'VLAN ' + vlanActiva + (nom ? ' · ' + nom : '');
+    document.getElementById('pv-resumen').textContent = `${g.seguros.length} enlaces, ${g.nodos.length} equipos` +
+        (g.probables.length ? ` (+${g.probables.length} enlaces probables)` : '') +
+        (g.indirectos.length ? `, ${g.indirectos.length} sin cable directo (entrecortados)` : '') +
+        (g.gw.length ? '. Llega a: ' + g.gw.map(nombreCorto).join(', ') : '');
+    const orden = g.nodos.sort((a, b) => nombreCorto(a).localeCompare(nombreCorto(b), 'es', { numeric: true }));
+    for (const id of ['vl-desde', 'vl-hasta']) {
+        const s = document.getElementById(id), previo = s.value;
+        s.innerHTML = '<option value="">— elegir equipo —</option>' +
+            orden.map(n => `<option value="${escH(n.id())}">${escH(nombreCorto(n))}</option>`).join('');
+        s.value = g.nodos.getElementById(previo).length ? previo : '';
+    }
+    // por defecto el camino sale del equipo donde termina la VLAN (router/gateway)
+    if (!document.getElementById('vl-desde').value && g.gw.length) document.getElementById('vl-desde').value = g.gw[0].id();
+    panel.hidden = false;
+    aplicarOpcionesVlan(g);
+    trazarCamino();
+}
+
+// ---- Opciones del panel de VLAN (se recuerdan en este navegador) ----
+const OPC_VLAN = ['vl-puertos', 'vl-sin-directo', 'vl-sin-vlan'];
+try {
+    const o = JSON.parse(localStorage.getItem('mapa-vlan-opciones') || '{}');
+    const restaurar = () => OPC_VLAN.forEach(id => { const c = document.getElementById(id); if (c) c.checked = !!o[id]; });
+    if (document.getElementById('vl-puertos')) restaurar(); else document.addEventListener('DOMContentLoaded', restaurar);
+} catch (e) {}
+function opcionesVlan() {
+    const o = {};
+    OPC_VLAN.forEach(id => o[id] = document.getElementById(id).checked);
+    try { localStorage.setItem('mapa-vlan-opciones', JSON.stringify(o)); } catch (e) {}
+    aplicarVlan();
+}
+// Puertos de un enlace vistos desde "de": [puerto en de, puerto en el otro]
+function puertosEnlace(e, de) {
+    const l1 = (e.data('label') || '').split('\n')[0];
+    let [p1, p2] = l1.startsWith('VLAN') ? ['', ''] : l1.split(' ↔ ');
+    if (de && e.source().id() !== de.id()) [p1, p2] = [p2, p1];
+    return [p1, p2].map(x => (x || '').replace(/\s*\(respaldo RSTP\)$/, ''));
+}
+function aplicarOpcionesVlan(g) {
+    const cy = TopologyViewer.cy, ver = id => document.getElementById(id).checked;
+    const directos = g.seguros.union(g.probables);
+    if (ver('vl-sin-directo')) g.indirectos.union(g.aislados).addClass('vlan-oculto');
+    if (ver('vl-sin-vlan')) cy.elements('.vlan-fuera').addClass('vlan-oculto');
+    if (!ver('vl-puertos')) return;
+    const conPuertos = ver('vl-sin-directo') ? directos : directos.union(g.indirectos);
+    conPuertos.forEach(e => e.data('puertosTxt', puertosEnlace(e).filter(Boolean).join(' ↔ ')));
+    conPuertos.addClass('vlan-puertos');
+    // continuidad: se recorre la VLAN desde donde llega (gateway) o desde el equipo con mas enlaces de la VLAN
+    const sub = g.nodos.union(conPuertos);
+    const inicio = g.gw.length ? g.gw[0] : g.nodos.max(n => n.connectedEdges().intersection(conPuertos).length).ele;
+    const vistos = new Set(), filas = [];
+    const recorrer = raiz => sub.bfs({ roots: raiz, visit: (v, e, u, i, prof) => {
+        if (e && !vistos.has(e.id())) {
+            vistos.add(e.id());
+            const [pa, pb] = puertosEnlace(e, u);
+            filas.push({ prof, html: `${escH(nombreCorto(u))} <span class="p">${escH(pa || '?')}</span> → ` +
+                `<span class="p">${escH(pb || '?')}</span> ${escH(nombreCorto(v))}` +
+                (e.data('backup') ? ' <i>(respaldo)</i>' : '') + (g.probables.contains(e) ? ' <i>(probable)</i>' : '') +
+                (g.indirectos.contains(e) ? ' <i>(sin cable directo)</i>' : '') });
+        }
+    }, directed: false });
+    if (inicio) recorrer(inicio);
+    // partes de la VLAN que no se tocan con la principal (islas)
+    let resto = conPuertos.filter(e => !vistos.has(e.id()));
+    while (resto.length) { recorrer(resto[0].source()); resto = conPuertos.filter(e => !vistos.has(e.id())); }
+    document.getElementById('vl-recorrido').innerHTML = filas.length
+        ? `<b>Recorrido por puertos (${filas.length} enlaces${inicio ? ', desde ' + escH(nombreCorto(inicio)) : ''})</b><ol>` +
+          filas.map(f => `<li style="margin-left:${Math.min(f.prof - 1, 6) * 10}px">${f.html}</li>`).join('') + '</ol>'
+        : '<div class="pv-nota">No hay enlaces con puertos conocidos en esta VLAN.</div>';
+}
+function pasosDe(ruta) {
+    const pasos = [];
+    for (let i = 1; i < ruta.length; i += 2) {
+        const e = ruta[i], de = ruta[i - 1], a = ruta[i + 1];
+        const l1 = (e.data('label') || '').split('\n')[0];
+        let [p1, p2] = l1.startsWith('VLAN ') ? ['', ''] : l1.split(' ↔ ');
+        if (e.source().id() !== de.id()) [p1, p2] = [p2, p1];
+        [p1, p2] = [p1, p2].map(x => (x || '').replace(/\s*\(respaldo RSTP\)$/, ''));
+        pasos.push(`<li>${escH(nombreCorto(de))} <span class="p">${escH(p1 || '?')}</span> → ` +
+                   `<span class="p">${escH(p2 || '?')}</span> ${escH(nombreCorto(a))}` +
+                   (e.data('backup') ? ' <i>(respaldo)</i>' : '') + (e.hasClass('vlan-prob') ? ' <i>(probable)</i>' : '') + '</li>');
+    }
+    return pasos.join('');
+}
+function trazarCamino() {
+    const cy = TopologyViewer.cy, out = document.getElementById('vl-ruta');
+    const a = document.getElementById('vl-desde').value, b = document.getElementById('vl-hasta').value;
+    cy.elements().removeClass('camino camino2');
+    out.innerHTML = '';
+    if (!vlanActiva || !a || !b || a === b) return;
+    const g = grafoVlan(vlanActiva), sub = g.nodos.union(g.seguros).union(g.probables);
+    const peso = extra => e => (g.probables.contains(e) ? 5 : 1) + (e.data('backup') ? 3 : 0) + (extra.contains(e) ? 100 : 0);
+    const ini = cy.getElementById(a), fin = cy.getElementById(b);
+    const dj = sub.dijkstra({ root: ini, weight: peso(cy.collection()) });
+    if (dj.distanceTo(fin) === Infinity) {
+        out.innerHTML = '<div class="aviso">No se encontró camino por cables directos en esta VLAN entre esos dos equipos (con lo visto en Bridge → Hosts y los vecinos).</div>';
+        return;
+    }
+    const ruta = dj.pathTo(fin);
+    // camino alternativo: el mejor que evita los enlaces del principal (si existe)
+    const usados = ruta.edges();
+    const dj2 = sub.dijkstra({ root: ini, weight: peso(usados) });
+    const ruta2 = dj2.distanceTo(fin) < 100 ? dj2.pathTo(fin) : null;
+    if (ruta2) ruta2.edges().addClass('camino2');
+    ruta.addClass('camino');
+    out.innerHTML = `<b>Camino (${usados.length} saltos)</b><ol>${pasosDe(ruta)}</ol>` +
+        (ruta2 ? `<div class="alt"><b>Alternativo (${ruta2.edges().length} saltos)</b><ol>${pasosDe(ruta2)}</ol></div>`
+               : '<div class="pv-nota">Sin camino alternativo en esta VLAN.</div>');
+}
+
+// ===== Solapa "Config": SNMP del equipo y boton Accept (guardar como dispositivo fijo) =====
+let datosAdmin = null;   // {csrf, comunidades} desde admin.php (cache)
+async function obtenerAdmin() {
+    if (!datosAdmin) {
+        const r = await fetch(BASE_URL + 'admin.php?token=1', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        datosAdmin = await r.json();
+    }
+    return datosAdmin;
+}
+
+function agregarSolapaConfig(data) {
+    const TV = TopologyViewer, esc = s => TV.dmEsc(s == null ? '' : String(s));
+    const tabs = document.getElementById('dm-tabs'), body = document.getElementById('dm-body');
+    const m = data.metadata || {}, s = m.snmp || {};
+    const nombreLimpio = String(data.id || '').trim();
+    document.getElementById('dm-title').textContent = data.nombreCorto || (data.label || data.id || '').split('\n')[0];
+
+    // la solapa "Config" original (configuracion por SSH) pasa a llamarse "Running config"
+    const sshTab = tabs.querySelector('.dm-tab[data-pane="config"]');
+    if (sshTab) sshTab.firstChild.textContent = 'Running config';
+
+    const fijo = m.fijo === true;
+    const tipo = ['router', 'switch', 'acceso', 'otro', 'olt'].includes(m.tipo) ? m.tipo
+               : (data.rol === 'router' ? 'router' : data.rol === 'distribucion' ? 'switch' : 'acceso');
+    const tieneIp = !!data.ip;
+    const chip = fijo ? '<span class="cfg-chip" style="background:rgba(34,197,94,.15);color:#4ade80">Fijo (host)</span>'
+                      : '<span class="cfg-chip" style="background:rgba(59,130,246,.18);color:#93c5fd">Automático</span>';
+    const comunidad = s.community
+        ? `<span id="cfg-comm" data-v="${esc(s.community)}">••••••••</span><button class="cfg-mini" id="cfg-ver">Mostrar</button>` : '-';
+    const verTxt = v => v === 'v1' ? 'SNMPv1' : v === 'v2c' ? 'SNMPv2' : (v || '-');
+
+    // filas: [clave, html ya escapado]
+    const filas = [['Dispositivo', chip], ['Versión SNMP', esc(verTxt(s.version))], ['Puerto', esc(s.puerto || 161)],
+                   ['Comunidad', comunidad]];
+    if (s.credencial) filas.push(['Credencial', esc(s.credencial)]);
+    if (s.nota) filas.push(['Nota', esc(s.nota)]);
+    const html = '<table class="dm-table">' +
+        filas.map(([k, v]) => `<tr><td class="dm-key">${esc(k)}</td><td>${v}</td></tr>`).join('') + '</table>' +
+    `<div class="cfg-form">
+        <label for="cfg-nombre">Nombre</label><input id="cfg-nombre" value="${esc(nombreLimpio)}" maxlength="60">
+        <label for="cfg-tipo">Tipo</label>
+        <select id="cfg-tipo">
+          <option value="router"${tipo === 'router' ? ' selected' : ''}>Router (lee ARP e IP neighbor)</option>
+          <option value="switch"${tipo === 'switch' ? ' selected' : ''}>Switch (LLDP, tabla de MAC)</option>
+          <option value="acceso"${tipo === 'acceso' ? ' selected' : ''}>Switch de acceso</option>
+          <option value="otro"${tipo === 'otro' ? ' selected' : ''}>Otro (AP, NVR, cámara…)</option>
+          <option value="olt"${tipo === 'olt' ? ' selected' : ''}>OLT (solo uplinks, enlaces manuales)</option>
+        </select>
+        <label>IP</label><input value="${esc(data.ip || 'sin IP')}" readonly>
+        <label for="cfg-puerto">Puerto SNMP</label><input id="cfg-puerto" value="${esc(s.puerto || 161)}" maxlength="5" inputmode="numeric">
+        <label for="cfg-version">Versión SNMP</label>
+        <select id="cfg-version"><option value="v2c">SNMPv2</option><option value="v1"${s.version === 'v1' ? ' selected' : ''}>SNMPv1</option></select>
+        <label for="cfg-nc">Community</label>
+        <input id="cfg-nc" type="password" autocomplete="off" maxlength="64" value="${esc(s.community || '')}" placeholder="vacío = probar todas">
+        <div class="cfg-acciones">
+          <button class="cfg-btn" id="cfg-aceptar" ${tieneIp ? '' : 'disabled'}>${fijo ? 'Guardar' : 'Accept'}</button>
+          <button class="cfg-btn sec" id="cfg-actualizar" hidden>⟳ Actualizar mapa ahora</button>
+          <button class="cfg-btn sec" id="cfg-ocultar" ${data.ip || /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(m.mac || m.mac_base || '') ? '' : 'disabled'}
+                  title="Quita este equipo del mapa (y lo que solo cuelga de él). Se vuelve a mostrar desde la página Hosts.">Ocultar del mapa</button>
+          <a class="cfg-mini" href="admin.php?mapa=${encodeURIComponent(nombreMapa)}" target="_blank" rel="noopener">Ver todos los hosts</a>
+          <span class="cfg-msg" id="cfg-msg">${tieneIp ? (fijo ? '' : 'Accept lo guarda como host fijo del mapa.')
+                                                   : 'Sin IP: no se puede guardar como host hasta que tenga una IP.'}</span>
+        </div>
+     </div>`;
+
+    const btn = document.createElement('button');
+    btn.className = 'dm-tab'; btn.dataset.pane = 'snmpcfg'; btn.textContent = 'Config';
+    tabs.appendChild(btn);
+    const pane = document.createElement('div');
+    pane.className = 'dm-pane'; pane.dataset.pane = 'snmpcfg'; pane.innerHTML = html;
+    body.appendChild(pane);
+    btn.onclick = () => {
+        tabs.querySelectorAll('.dm-tab').forEach(b => b.classList.toggle('active', b === btn));
+        body.querySelectorAll('.dm-pane').forEach(p => p.classList.toggle('active', p === pane));
+    };
+
+    const ver = pane.querySelector('#cfg-ver');
+    if (ver) ver.onclick = () => {
+        const c = pane.querySelector('#cfg-comm'), oculto = c.textContent.startsWith('•');
+        c.textContent = oculto ? c.dataset.v : '••••••••'; ver.textContent = oculto ? 'Ocultar' : 'Mostrar';
+    };
+    const msg = pane.querySelector('#cfg-msg');
+    obtenerAdmin().catch(() => {
+        pane.querySelector('#cfg-aceptar').disabled = true;
+        msg.textContent = 'Este mapa no se administra desde la web.';
+    });
+
+    pane.querySelector('#cfg-aceptar').onclick = async ev => {
+        const b = ev.currentTarget; b.disabled = true;
+        msg.style.color = ''; msg.textContent = 'Guardando…';
+        try {
+            const adm = await obtenerAdmin();
+            const cuerpo = new URLSearchParams({
+                csrf: adm.csrf, accion: 'host_guardar', mapa: nombreMapa, ip_original: data.ip || '',
+                nombre: pane.querySelector('#cfg-nombre').value.trim(), ip: data.ip || '',
+                tipo: pane.querySelector('#cfg-tipo').value, puerto: pane.querySelector('#cfg-puerto').value.trim() || '161',
+                version: pane.querySelector('#cfg-version').value, community: pane.querySelector('#cfg-nc').value,
+            });
+            const r = await fetch(BASE_URL + 'admin.php', { method: 'POST', body: cuerpo });
+            const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+            if (!j.ok) { msg.style.color = '#f87171'; msg.textContent = j.error || 'No se pudo guardar'; return; }
+            msg.style.color = '#4ade80'; msg.textContent = j.mensaje;
+            b.textContent = 'Guardar';
+            m.fijo = true;                          // en pantalla ya cuenta como fijo
+            pane.querySelector('#cfg-actualizar').hidden = false;
+        } catch (e) {
+            msg.style.color = '#f87171'; msg.textContent = 'No se pudo guardar: ' + e.message;
+        } finally { b.disabled = false; }
+    };
+    pane.querySelector('#cfg-actualizar').onclick = () => { TV.hideNodeInfo(); actualizarMapa(); };
+    pane.querySelector('#cfg-ocultar').onclick = async ev => {
+        const nombre = data.nombreCorto || (data.label || data.id || '').split('\n')[0];
+        const nucleo = ['router', 'switch'].includes(m.tipo) && m.fijo;
+        if (!confirm(`¿Ocultar "${nombre}" de este mapa?` + (nucleo
+                ? '\n\nEs un router/switch del mapa: también se ocultará lo que solo cuelga de él.' : '') +
+                '\n\nPara volver a mostrarlo: página Hosts → "Equipos descubiertos ocultos" → Mostrar.')) return;
+        const b = ev.currentTarget; b.disabled = true;
+        msg.style.color = ''; msg.textContent = 'Ocultando…';
+        try {
+            const adm = await obtenerAdmin();
+            const mac = String(m.mac && m.mac !== '-' ? m.mac : (m.mac_base || '')).toLowerCase();
+            const r = await fetch(BASE_URL + 'admin.php', { method: 'POST', body: new URLSearchParams({
+                csrf: adm.csrf, accion: 'ocultar', mapa: nombreMapa, ip: data.ip || '', mac, nombre }) });
+            const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+            if (!j.ok) { msg.style.color = '#f87171'; msg.textContent = j.error || 'No se pudo ocultar'; b.disabled = false; return; }
+            // se quita ya de la pantalla; la proxima actualizacion lo deja fuera del mapa publicado
+            TV.hideNodeInfo();
+            TV.cy.getElementById(data.id).remove();
+            avisar(`"${nombre}" oculto. Se aplica del todo en la próxima ⟳ Actualizar.`, '#4ade80');
+        } catch (e) {
+            msg.style.color = '#f87171'; msg.textContent = 'No se pudo ocultar: ' + e.message; b.disabled = false;
+        }
+    };
+}
+
+(function instalar() {
+    const TV = TopologyViewer, origLayout = TV.applyLayout.bind(TV), origLoad = TV.loadTopology.bind(TV);
+    const origShow = TV.showNodeInfo.bind(TV);
+    TV.showNodeInfo = function (data) { if (modoSeleccion) return; origShow(data); agregarSolapaConfig(data); };
+    TV.defaultLayout = 'ordenado';
+    TV.applyLayout = function (alg) {
+        if (alg === 'ordenado' || !alg) {
+            // Durante la carga los roles aun no estan asignados: el orden se aplica despues de decorar()
+            if (!this._cargando) layoutOrdenado(this.cy);
+            this.lastLayout = 'ordenado';
+            return;
+        }
+        return origLayout(alg);
+    };
+    TV.loadTopology = function (json) {
+        this._cargando = true;
+        try { origLoad(json); } finally { this._cargando = false; }
+        decorar(this.cy);
+        estiloTamano(this.cy);
+        this.cy.style()
+            .selector('node.h-nuevo').style({ 'border-color': '#22c55e', 'border-width': 7, 'border-style': 'double' })
+            .selector('edge.h-nuevo').style({ 'line-color': '#22c55e', 'width': 3.5, 'opacity': 1, 'line-style': 'solid' })
+            .update();
+        layoutOrdenado(this.cy);
+        llenarVlans();
+        this.cy.style().selector('.tipo-oculto').style({ 'display': 'none' }).update();
+        aplicarTipos();
+        aplicarDatos();
+        const cy = this.cy;
+        if (this._eventosListos) return;   // al recargar datos (boton Actualizar) no se registran de nuevo
+        this._eventosListos = true;
+        // Al pasar sobre un equipo: resaltar sus enlaces con los puertos y atenuar el resto
+        cy.on('mouseover', 'node', e => {
+            const vecinos = e.target.closedNeighborhood();
+            cy.elements().not(vecinos).addClass('atenuado');
+            e.target.connectedEdges().addClass('ver');
+        });
+        cy.on('mouseout', 'node', () => {
+            cy.elements().removeClass('atenuado');
+            if (!puertosVisibles) cy.edges().removeClass('ver');
+        });
+        cy.on('mouseover', 'edge', e => e.target.addClass('ver'));
+        cy.on('mouseout', 'edge', e => { if (!puertosVisibles) e.target.removeClass('ver'); });
+        // fuera del modo Seleccionar, un clic deja seleccionado solo ese equipo (Shift/Ctrl + clic suma)
+        cy.on('tap', 'node', e => {
+            const oe = e.originalEvent || {};
+            if (!modoSeleccion && !oe.shiftKey && !oe.ctrlKey && !oe.metaKey) cy.nodes().not(e.target).unselect();
+        });
+    };
+})();
+</script>
+<script>
+// Carga web: viewer.html?map=<nombre> lee data/<nombre>.json (publicado con seccart2-publicar)
+const nombreMapa = new URLSearchParams(location.search).get('map');
+
+function descargarPNG() {
+    const b64 = TopologyViewer.exportPNG();
+    if (!b64) return;
+    const a = document.createElement('a');
+    a.href = 'data:image/png;base64,' + b64;
+    a.download = (nombreMapa || 'mapa') + '.png';
+    a.click();
+}
+
+// URLs absolutas sin usuario:clave (Chrome rechaza fetch si la página se abrió como http://user:pass@host)
+const BASE_URL = location.origin + location.pathname.replace(/[^/]*$/, '');
+// Sesion vencida: cualquier pedido al servidor responde 401 y se vuelve al ingreso
+const fetchOriginal = window.fetch.bind(window);
+window.fetch = async (...a) => {
+    const r = await fetchOriginal(...a);
+    if (r.status === 401) location.href = BASE_URL + 'login.php?volver=' + encodeURIComponent('viewer.php' + location.search);
+    return r;
+};
+
+// Carga datos sin mover la vista: mismo zoom, misma posicion de los equipos que ya estaban
+function cargarConservando(data) {
+    const cy = TopologyViewer.cy;
+    if (!cy || !cy.nodes().length) { TopologyViewer.loadTopology(data); return; }
+    const vista = { zoom: cy.zoom(), pan: { ...cy.pan() } }, pos = {};
+    cy.nodes().forEach(n => { pos[n.id()] = { ...n.position() }; });
+    TopologyViewer.loadTopology(data);
+    cy.batch(() => cy.nodes().forEach(n => { if (pos[n.id()]) n.position(pos[n.id()]); }));
+    cy.viewport(vista);
+}
+function cargarDatos(conservar) {
+    return cargarPosiciones().then(() => fetch(BASE_URL + 'datos.php?map=' + encodeURIComponent(nombreMapa), { cache: 'no-store', credentials: 'same-origin' })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(data => conservar ? cargarConservando(data) : TopologyViewer.loadTopology(data)));
+}
+
+// ---- En vivo: si el servidor actualizo el mapa (automatico o desde otra pagina), se recarga solo ----
+let finCargado = null;
+async function vigilarActualizaciones() {
+    if (siguiendo || document.hidden) return;
+    try {
+        const e = await leerEstado();
+        if (e.estado === 'ejecutando' || e.en_cola) {
+            ponerEstado(e.estado === 'ejecutando' ? 'Actualizando…' : 'En cola…', '#fbbf24');
+            return;
+        }
+        if (!e.fin) return;
+        if (finCargado && e.fin !== finCargado && e.estado === 'ok') {
+            if (hist.abierto) cargarIndiceHist().catch(() => {});
+            if (!hist.abierto || hist.idx >= hist.items.length) await cargarDatos(true);
+        }
+        finCargado = e.fin;
+        ponerEstado((e.estado === 'error' ? 'Error ' : 'Actualizado ') + e.fin.slice(5, 16) +
+                    (e.auto_min ? ` · auto ${e.auto_min} min` : ''), e.estado === 'error' ? '#f87171' : '');
+    } catch (err) { /* sin conexion: se reintenta */ }
+}
+setInterval(vigilarActualizaciones, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) vigilarActualizaciones(); });
+
+// ---- Historial (7 dias): una foto del mapa por cada actualizacion ----
+const hist = { abierto: false, items: [], idx: 0, cache: new Map(), play: null, pedido: 0 };
+async function cargarIndiceHist() {
+    const r = await fetch(BASE_URL + 'historial.php?map=' + encodeURIComponent(nombreMapa), { cache: 'no-store' });
+    const j = await r.json();
+    const enVivo = hist.idx >= hist.items.length;
+    hist.items = j.items || [];
+    const s = document.getElementById('h-slider');
+    s.max = hist.items.length;            // el ultimo punto es "en vivo"
+    if (enVivo) hist.idx = hist.items.length;
+    s.value = hist.idx;
+}
+async function fotoHist(id) {
+    if (hist.cache.has(id)) return hist.cache.get(id);
+    const r = await fetch(BASE_URL + 'historial.php?map=' + encodeURIComponent(nombreMapa) + '&id=' + encodeURIComponent(id));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    hist.cache.set(id, d);
+    if (hist.cache.size > 60) hist.cache.delete(hist.cache.keys().next().value);
+    return d;
+}
+async function alternarHistorial(forzar) {
+    const abrir = forzar === undefined ? !hist.abierto : forzar;
+    if (!abrir) {
+        pararHist();
+        const volver = hist.idx < hist.items.length;
+        hist.abierto = false;
+        document.body.classList.remove('con-hist');
+        document.getElementById('btn-hist').classList.remove('activo');
+        if (volver) { hist.idx = hist.items.length; await cargarDatos(true); }
+        TopologyViewer.cy.elements().removeClass('h-nuevo');
+        return;
+    }
+    hist.abierto = true;
+    hist.idx = Number.MAX_SAFE_INTEGER;
+    document.body.classList.add('con-hist');
+    document.getElementById('btn-hist').classList.add('activo');
+    document.getElementById('h-fecha').textContent = 'Cargando…';
+    try {
+        await cargarIndiceHist();
+        rotularHist(null, null);
+    } catch (e) {
+        document.getElementById('h-fecha').textContent = 'No se pudo leer el historial: ' + e.message;
+    }
+}
+function nodosYEnlaces(data) {
+    const nodos = new Set(), enlaces = new Set();
+    for (const [a, d] of Object.entries(data || {})) {
+        nodos.add(a);
+        for (const b of Object.keys((d && d.peers) || {})) { nodos.add(b); enlaces.add([a, b].sort().join('\u0000')); }
+    }
+    return { nodos, enlaces };
+}
+function fechaLarga(f) {
+    const d = new Date(f.replace(' ', 'T'));
+    return isNaN(d) ? f : d.toLocaleString('es', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+function rotularHist(item, cambios) {
+    const fecha = document.getElementById('h-fecha'), cam = document.getElementById('h-cambios'),
+          quit = document.getElementById('h-quitados');
+    quit.hidden = true;
+    if (!item) {
+        fecha.innerHTML = '<span class="h-vivo">● En vivo</span>';
+        cam.textContent = hist.items.length
+            ? `${hist.items.length} instantes guardados desde ${fechaLarga(hist.items[0].fecha)}. Mueve la barra para ver cómo estaba la red.`
+            : 'Todavía no hay historial: se guarda uno en cada actualización (automática o con ⟳ Actualizar).';
+        return;
+    }
+    fecha.textContent = fechaLarga(item.fecha);
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    let txt = `${item.equipos} equipos · ${item.enlaces} enlaces`;
+    if (cambios) {
+        const n = (v, cls, signo) => v ? `<span class="${cls}">${signo}${v}</span>` : `${signo}0`;
+        txt += ` — respecto al anterior: equipos ${n(cambios.nodosMas, 'h-mas', '+')} / ${n(cambios.nodosMenos.length, 'h-menos', '−')},` +
+               ` enlaces ${n(cambios.enlMas, 'h-mas', '+')} / ${n(cambios.enlMenos, 'h-menos', '−')}` +
+               (cambios.nodosMas || cambios.enlMas ? ' (lo nuevo, en verde)' : '');
+        if (cambios.nodosMenos.length) {
+            quit.hidden = false;
+            quit.innerHTML = '<b>Ya no aparecen:</b> ' + cambios.nodosMenos.map(x => esc(x.split('\n')[0])).join(', ');
+        }
+    } else {
+        txt += ' — primer instante guardado';
+    }
+    cam.innerHTML = txt;
+}
+async function moverHist(i) {
+    i = Math.max(0, Math.min(hist.items.length, i | 0));
+    hist.idx = i;
+    document.getElementById('h-slider').value = i;
+    const pedido = ++hist.pedido;
+    const cy = TopologyViewer.cy;
+    if (i >= hist.items.length) {
+        pararHist();
+        await cargarDatos(true);
+        if (pedido !== hist.pedido) return;
+        cy.elements().removeClass('h-nuevo');
+        rotularHist(null, null);
+        return;
+    }
+    const item = hist.items[i];
+    document.getElementById('h-fecha').textContent = fechaLarga(item.fecha) + ' · cargando…';
+    try {
+        const [data, previa] = await Promise.all([fotoHist(item.id), i > 0 ? fotoHist(hist.items[i - 1].id) : null]);
+        if (pedido !== hist.pedido) return;     // el usuario ya movio la barra a otro instante
+        cargarConservando(data);
+        let cambios = null;
+        cy.elements().removeClass('h-nuevo');
+        if (previa) {
+            const ant = nodosYEnlaces(previa), act = nodosYEnlaces(data);
+            let nodosMas = 0, enlMas = 0;
+            cy.nodes().forEach(n => { if (!ant.nodos.has(n.id())) { n.addClass('h-nuevo'); nodosMas++; } });
+            cy.edges().forEach(e => {
+                if (!ant.enlaces.has([e.source().id(), e.target().id()].sort().join('\u0000'))) { e.addClass('h-nuevo'); enlMas++; }
+            });
+            cambios = { nodosMas, enlMas, nodosMenos: [...ant.nodos].filter(x => !act.nodos.has(x)),
+                        enlMenos: [...ant.enlaces].filter(x => !act.enlaces.has(x)).length };
+        }
+        rotularHist(item, cambios);
+    } catch (e) {
+        if (pedido === hist.pedido) document.getElementById('h-fecha').textContent = 'No se pudo cargar ese instante: ' + e.message;
+    }
+}
+let tHist = null;
+function pasoHist(d) { pararHist(); moverHist(hist.idx + d); }
+function pararHist() {
+    if (hist.play) { clearInterval(hist.play); hist.play = null; }
+    document.getElementById('h-play').textContent = 'Reproducir';
+}
+function reproducirHist() {
+    if (hist.play) { pararHist(); return; }
+    if (!hist.items.length) return;
+    if (hist.idx >= hist.items.length) moverHist(0);
+    document.getElementById('h-play').textContent = 'Pausa';
+    hist.play = setInterval(() => {
+        if (hist.idx >= hist.items.length - 1) { pararHist(); moverHist(hist.items.length); return; }
+        moverHist(hist.idx + 1);
+    }, 1500);
+}
+
+// ---- Boton "Actualizar": encola la actualizacion en el servidor, sigue el avance y recarga los datos ----
+function ponerEstado(texto, color) {
+    const el = document.getElementById('estado-mapa');
+    el.textContent = texto;
+    el.style.color = color || '';
+}
+async function leerEstado() {
+    const r = await fetch(BASE_URL + 'admin.php?estado=' + encodeURIComponent(nombreMapa), { cache: 'no-store' });
+    return r.json();
+}
+async function mostrarUltimaActualizacion() {
+    try {
+        const e = await leerEstado();
+        if (e.estado === 'ejecutando' || e.en_cola) { seguirActualizacion(e.inicio || ''); return; }
+        if (e.fin) ponerEstado('Actualizado ' + e.fin.slice(5, 16) + (e.estado === 'error' ? ' (con error)' : '') +
+                               (e.auto_min ? ` · auto ${e.auto_min} min` : ''), e.estado === 'error' ? '#f87171' : '');
+        finCargado = e.fin || finCargado;
+    } catch (err) { /* mapa sin administracion web: sin estado */ }
+}
+let siguiendo = false;
+async function seguirActualizacion(inicioPrevio) {
+    if (siguiendo) return;
+    siguiendo = true;
+    const btn = document.getElementById('btn-actualizar');
+    btn.disabled = true; btn.style.opacity = .5;
+    const t0 = Date.now();
+    try {
+        for (;;) {
+            await new Promise(r => setTimeout(r, 4000));
+            const e = await leerEstado();
+            const seg = Math.round((Date.now() - t0) / 1000);
+            const nuevo = e.inicio && e.inicio !== inicioPrevio;
+            if (nuevo && !e.en_cola && (e.estado === 'ok' || e.estado === 'error')) {
+                if (e.estado === 'ok') {
+                    await cargarDatos(true);
+                    finCargado = e.fin;
+                    ponerEstado('Actualizado ' + e.fin.slice(5, 16), '#4ade80');
+                } else {
+                    ponerEstado('Error: ' + (e.resumen || 'ver la página Hosts'), '#f87171');
+                }
+                break;
+            }
+            ponerEstado(`Actualizando… ${seg} s (suele tardar ~2-3 min)`, '#fbbf24');
+            if (seg > 1800) { ponerEstado('Tarda demasiado: revisa la página Hosts', '#f87171'); break; }
+        }
+    } finally {
+        siguiendo = false;
+        btn.disabled = false; btn.style.opacity = '';
+    }
+}
+async function actualizarMapa() {
+    if (siguiendo) return;
+    try {
+        ponerEstado('Enviando…', '#fbbf24');
+        const previo = await leerEstado().catch(() => ({}));
+        const tok = await (await fetch(BASE_URL + 'admin.php?token=1', { cache: 'no-store' })).json();
+        const cuerpo = new URLSearchParams({ csrf: tok.csrf, accion: 'actualizar', mapa: nombreMapa, ajax: '1' });
+        const r = await fetch(BASE_URL + 'admin.php', { method: 'POST', body: cuerpo });
+        const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+        if (!j.ok) { ponerEstado(j.error || 'No se pudo pedir la actualización', '#f87171'); return; }
+        seguirActualizacion(previo.inicio || '');
+    } catch (e) {
+        ponerEstado('No se pudo pedir la actualización: ' + e.message, '#f87171');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    TopologyViewer.showControls(true);
+    if (!nombreMapa) { location.href = './'; return; }
+    document.title = 'Mapa: ' + nombreMapa;
+    aplicarBlanco(prefBlanco() === '1');
+    // nombre del mapa (editable en la pagina Hosts)
+    obtenerAdmin().then(a => {
+        const t = (a.titulos || {})[nombreMapa] || nombreMapa;
+        document.title = 'Mapa: ' + t;
+        document.getElementById('titulo-mapa').textContent = t;
+    }).catch(() => { document.getElementById('titulo-mapa').textContent = nombreMapa; });
+    cargarDatos()
+        .then(mostrarUltimaActualizacion)
+        .catch(async e => {
+            // mapa nuevo: todavia no se publico (404); si se esta generando, esperar y cargarlo al terminar
+            if (/404/.test(e.message)) {
+                const est = await leerEstado().catch(() => ({}));
+                if (est.estado === 'ejecutando' || est.en_cola) {
+                    ponerEstado('Generando el mapa por primera vez…', '#fbbf24');
+                    seguirActualizacion(est.estado === 'ejecutando' ? '' : (est.inicio || ''));
+                } else if (est.estado === 'error') {
+                    ponerEstado('Error al generar el mapa: ' + (est.resumen || 'ver la página Hosts'), '#f87171');
+                } else {
+                    ponerEstado('Este mapa todavía no tiene datos: pulsa ⟳ Actualizar', '#fbbf24');
+                }
+                return;
+            }
+            alert('No se pudo cargar el mapa "' + nombreMapa + '": ' + e.message);
+        });
+});
+</script>
+</body>
+</html>

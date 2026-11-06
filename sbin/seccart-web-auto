@@ -1,0 +1,57 @@
+#!/usr/bin/python3
+"""Pone en la cola la actualizacion de los mapas con "Actualizacion automatica" (auto_min en su configuracion).
+
+Lo ejecuta seccart-web-auto.timer cada minuto. Solo encola si el mapa no esta en cola ni ejecutandose y
+ya paso su intervalo desde el inicio de la ultima actualizacion. Lo procesa seccart-web.service, como
+el boton "Actualizar" de la web.
+"""
+import json
+import os
+import re
+import shutil
+import time
+from pathlib import Path
+
+BASE = Path('/var/lib/seccart-web')
+COLA, MAPAS, ESTADO = BASE / 'cola', BASE / 'mapas', BASE / 'estado'
+NOMBRE_MAPA = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
+INTERVALOS = {5, 10, 15, 30, 60}
+
+
+def leer(f, defecto):
+    try:
+        return json.loads(f.read_text(encoding='utf-8'))
+    except Exception:
+        return defecto
+
+
+def main():
+    en_cola = {leer(f, {}).get('mapa') for f in COLA.glob('*.json')}
+    ahora = time.time()
+    for f in sorted(MAPAS.glob('*.json')):
+        mapa = f.stem
+        if not NOMBRE_MAPA.match(mapa) or mapa in en_cola:
+            continue
+        intervalo = leer(f, {}).get('auto_min')
+        if intervalo not in INTERVALOS:
+            continue
+        e = leer(ESTADO / f'{mapa}.json', {})
+        try:
+            inicio = time.mktime(time.strptime(e.get('inicio', ''), '%Y-%m-%d %H:%M:%S'))
+        except ValueError:
+            inicio = 0
+        # "ejecutando" de hace mas de 2 horas: quedo colgado (reinicio del servidor), se vuelve a pedir
+        if e.get('estado') == 'ejecutando' and ahora - inicio < 7200:
+            continue
+        if ahora - inicio < intervalo * 60 - 30:
+            continue
+        nombre = f"{time.strftime('%Y%m%d%H%M%S')}-auto-{mapa}"
+        tmp = COLA / f'{nombre}.tmp'
+        tmp.write_text(json.dumps({'accion': 'actualizar', 'mapa': mapa, 'origen': 'auto'}))
+        shutil.chown(tmp, 'root', 'www-data')
+        os.chmod(tmp, 0o660)
+        tmp.replace(COLA / f'{nombre}.json')
+
+
+if __name__ == '__main__':
+    main()

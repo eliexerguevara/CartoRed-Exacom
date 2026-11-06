@@ -1,0 +1,161 @@
+#!/opt/seccart2/bin/python
+"""Publica un map.json de SecureCartography2 en el visor web (http://<servidor>/mapa).
+
+Uso: seccart2-publicar <carpeta_del_recorrido | map.json> [nombre]
+"""
+import copy
+import json
+import re
+import sys
+from pathlib import Path
+
+from sc2.ui.widgets.platform_icons import get_platform_icon_manager
+
+DESTINO = Path('/var/www/html/mapa/data')
+
+# Bases de fabricantes por MAC (OUI): la de Wireshark (mas actual, cron mensual) y la del sistema
+MANUF = Path('/var/lib/seccart-oui/manuf')
+IEEE_OUI = Path('/usr/share/ieee-data/oui.txt')
+
+# Nombre comercial a partir del nombre registrado en la IEEE
+MARCAS = [
+    (r'dahua', 'DAHUA'), (r'hikvision|hangzhou hikvision', 'HIKVISION'), (r'routerboard|mikrotik', 'MIKROTIK'),
+    (r'ubiquiti', 'UBIQUITI'), (r'tp-?link', 'TP-LINK'), (r'cisco', 'CISCO'), (r'huawei', 'HUAWEI'),
+    (r'\bzte\b', 'ZTE'), (r'juniper', 'JUNIPER'), (r'aruba', 'ARUBA'), (r'hewlett|\bhpe?\b', 'HP'),
+    (r'ruijie', 'RUIJIE'), (r'fiberhome', 'FIBERHOME'), (r'cambium', 'CAMBIUM'), (r'uniview', 'UNIVIEW'),
+    (r'grandstream', 'GRANDSTREAM'), (r'fortinet', 'FORTINET'), (r'arista', 'ARISTA'), (r'd-?link', 'D-LINK'),
+    (r'tenda', 'TENDA'), (r'xiaomi', 'XIAOMI'), (r'samsung', 'SAMSUNG'), (r'apple', 'APPLE'), (r'dell', 'DELL'),
+    (r'vmware', 'VMWARE'), (r'intel', 'INTEL'), (r'super ?micro', 'SUPERMICRO'), (r'mellanox|nvidia', 'NVIDIA'),
+    (r'realtek', 'REALTEK'), (r'raspberry', 'RASPBERRY PI'), (r'espressif', 'ESPRESSIF'), (r'ezviz', 'EZVIZ'), (r'axis comm', 'AXIS'), (r'zkteco', 'ZKTECO'),
+]
+GENERICAS = {'zhejiang', 'shenzhen', 'hangzhou', 'beijing', 'shanghai', 'guangzhou', 'guangdong', 'co', 'co.',
+             'ltd', 'ltd.', 'inc', 'inc.', 'technology', 'technologies', 'tech', 'corp', 'corporation', 'the'}
+
+
+def cargar_oui():
+    """Devuelve lista [(bits_prefijo, prefijo_int, nombre)] ordenada de mas especifico a menos."""
+    tabla = []
+    if MANUF.is_file():
+        for line in MANUF.read_text(encoding='utf-8', errors='ignore').splitlines():
+            if not line or line.startswith('#'):
+                continue
+            partes = line.split('\t')
+            m = re.match(r'([0-9A-Fa-f:]+)(?:/(\d+))?$', partes[0].strip())
+            if not m or len(partes) < 2:
+                continue
+            hexs = m.group(1).replace(':', '')
+            bits = int(m.group(2)) if m.group(2) else len(hexs) * 4
+            nombre = (partes[2] if len(partes) > 2 and partes[2].strip() else partes[1]).strip()
+            tabla.append((bits, int(hexs.ljust(12, '0'), 16) >> (48 - bits), nombre))
+    elif IEEE_OUI.is_file():
+        for line in IEEE_OUI.read_text(encoding='utf-8', errors='ignore').splitlines():
+            m = re.match(r'([0-9A-F]{2})-([0-9A-F]{2})-([0-9A-F]{2})\s+\(hex\)\s+(.*)', line)
+            if m:
+                tabla.append((24, int(''.join(m.groups()[:3]), 16), m.group(4).strip()))
+    tabla.sort(key=lambda t: -t[0])
+    return tabla
+
+
+def fabricante(mac, tabla, _cache={}):
+    h = re.sub(r'[^0-9A-Fa-f]', '', mac or '')
+    if len(h) != 12:
+        return ''
+    if not _cache:
+        for bits, pref, nombre in tabla:
+            _cache.setdefault(bits, {}).setdefault(pref, nombre)
+    v = int(h, 16)
+    for bits in sorted(_cache, reverse=True):
+        nombre = _cache[bits].get(v >> (48 - bits))
+        if nombre:
+            return nombre
+    return ''
+
+
+def marca_comercial(nombre_ieee):
+    for patron, marca in MARCAS:
+        if re.search(patron, nombre_ieee, re.I):
+            return marca
+    palabras = [p for p in re.split(r'[\s,]+', nombre_ieee) if p and p.lower() not in GENERICAS]
+    return palabras[0].upper() if palabras else ''
+
+
+def agregar_marcas(data, tabla):
+    """Pone node_details.vendor = marca (por MAC; si no hay MAC, por la plataforma)."""
+    if not isinstance(data, dict) or 'cytoscape' in data or 'nodes' in data:
+        return
+    for dev in data.values():
+        if not isinstance(dev, dict):
+            continue
+        det = dev.setdefault('node_details', {})
+        meta = det.setdefault('metadata', {}) if isinstance(det.get('metadata', {}), dict) else {}
+        mac = meta.get('mac') if meta.get('mac') not in (None, '-') else meta.get('mac_base')
+        marca, origen = '', ''
+        if mac:
+            ieee = fabricante(mac, tabla)
+            if ieee:
+                marca, origen = marca_comercial(ieee), f'MAC {mac} ({ieee})'
+        if not marca:
+            plat = det.get('platform', '') or ''
+            for patron, m in [(r'RouterOS|MikroTik', 'MIKROTIK'), (r'DH-|Dahua', 'DAHUA'),
+                              (r'Cisco|IOS', 'CISCO'), (r'Arista|EOS', 'ARISTA'), (r'Junos|Juniper', 'JUNIPER')]:
+                if re.search(patron, plat, re.I):
+                    marca, origen = m, 'plataforma'
+                    break
+        if marca:
+            det['vendor'] = marca
+            meta['marca'] = marca
+            meta['marca_segun'] = origen
+            det['metadata'] = meta
+
+
+def icono_web(manager, platform):
+    # MikroTik CRS (Cloud Router Switch) son switches; el mapa de iconos los toma como router
+    if re.search(r'RouterOS\s+CRS', platform or '', re.I):
+        return 'icons/layer_3_switch.jpg'
+    # Switches de acceso Dahua y equipos anexados sin SNMP (seccart2-anexar)
+    if re.search(r'DH-HS|^Sin SNMP|^Sin respuesta', platform or '', re.I):
+        return 'icons/workgroup_switch.jpg'
+    # El gestor devuelve file:///.../icons_lib/x.jpg; en la web se sirve como icons/x.jpg
+    url = manager.get_icon_url(platform or '')
+    return 'icons/' + url.split('/icons_lib/')[-1] if url else ''
+
+
+def agregar_iconos(data, manager):
+    data = copy.deepcopy(data)
+    if 'cytoscape' in data or 'nodes' in data:
+        nodos = data['cytoscape'].get('nodes', []) if 'cytoscape' in data else data['nodes']
+        for n in nodos:
+            d = n.get('data', n)
+            d['icon'] = icono_web(manager, d.get('platform'))
+    else:
+        for dev in data.values():
+            if isinstance(dev, dict):
+                det = dev.setdefault('node_details', {})
+                det['icon'] = icono_web(manager, det.get('platform'))
+    return data
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print(__doc__)
+        sys.exit(1)
+    origen = Path(sys.argv[1]).resolve()
+    archivo = origen / 'map.json' if origen.is_dir() else origen
+    if not archivo.is_file():
+        sys.exit(f'No encontré {archivo}')
+    nombre = sys.argv[2] if len(sys.argv) > 2 else (origen.name if origen.is_dir() else origen.parent.name)
+    nombre = re.sub(r'[^A-Za-z0-9._-]', '_', nombre).strip('.') or 'mapa'
+
+    data = json.loads(archivo.read_text(encoding='utf-8'))
+    data = agregar_iconos(data, get_platform_icon_manager())
+    agregar_marcas(data, cargar_oui())
+    DESTINO.mkdir(parents=True, exist_ok=True)
+    salida = DESTINO / f'{nombre}.json'
+    salida.write_text(json.dumps(data), encoding='utf-8')
+    salida.chmod(0o644)
+    print(f'Publicado: {salida}  ({len(data)} equipos)')
+    print(f'Ver en:    http://<ip-del-servidor>/mapa/viewer.html?map={nombre}')
+
+
+if __name__ == '__main__':
+    main()

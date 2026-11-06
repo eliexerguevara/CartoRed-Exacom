@@ -1,0 +1,13 @@
+# Datos de la red y secretos: nunca van al repositorio
+web/data/
+*.json.gz
+vault.pass
+.htpasswd*
+usuarios.json
+comunidades.json
+credenciales.json
+hosts.json
+enlaces.json
+*.bak*
+*.tmp
+__pycache__/
