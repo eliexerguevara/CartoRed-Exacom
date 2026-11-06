@@ -40,8 +40,9 @@ def main():
             inicio = time.mktime(time.strptime(e.get('inicio', ''), '%Y-%m-%d %H:%M:%S'))
         except ValueError:
             inicio = 0
-        # "ejecutando" de hace mas de 2 horas: quedo colgado (reinicio del servidor), se vuelve a pedir
-        if e.get('estado') == 'ejecutando' and ahora - inicio < 7200:
+        # "ejecutando" de hace mas de 2 horas: quedo colgado (reinicio del servidor), se vuelve a pedir.
+        # Si lo recorre un proxy, el pedido vence a los 30 minutos (proxy apagado o sin conexion).
+        if e.get('estado') == 'ejecutando' and ahora - inicio < (1800 if e.get('proxy') else 7200):
             continue
         if ahora - inicio < intervalo * 60 - 30:
             continue

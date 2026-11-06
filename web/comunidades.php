@@ -42,7 +42,7 @@ unset($_SESSION['flash'], $_SESSION['flash_err']);
       <p class="sub" style="margin:0 0 12px;font-size:13px">Sirve para leer las VLANs tagged / untagged configuradas en el bridge,
         tengan o no tráfico. Crea en los MikroTik un usuario del grupo <b>read</b> (el mismo en todos) con el servicio
         <b>api</b> (8728) o <b>api-ssl</b> (8729) habilitado, y activa <b>Leer VLANs del bridge por API</b> en cada router/switch
-        en la página Hosts. Se guarda cifrado como las comunidades.</p>
+        en la página Hosts. Se guarda en el servidor en un archivo que solo lee el servicio; la web nunca ve la contraseña.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;align-items:end">
         <input type="hidden" name="csrf" value="<?= h($_SESSION['csrf']) ?>"><input type="hidden" name="accion" value="api_usuario">
         <label class="campo">Usuario<input name="api_usuario" autocomplete="off" required maxlength="40" pattern="[A-Za-z0-9._@\-]{1,40}"

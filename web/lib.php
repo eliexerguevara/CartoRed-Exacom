@@ -72,7 +72,7 @@ function requiere_login() {
 }
 function volver_seguro($v) {
     // solo paginas de esta carpeta (nada de https://otro-sitio o //otro)
-    return is_string($v) && preg_match('#^(index|admin|viewer|nuevo|usuarios|comunidades)\.php(\?[^\s<>"]*)?$#', $v) ? $v : 'index.php';
+    return is_string($v) && preg_match('#^(index|admin|viewer|nuevo|usuarios|comunidades|proxys)\.php(\?[^\s<>"]*)?$#', $v) ? $v : 'index.php';
 }
 
 // Estilos comunes (menu, botones, formularios) y menu superior
@@ -87,7 +87,7 @@ function cabeza($titulo) { ?>
 function menu($activo) {
     $u = usuario_actual();
     $items = ['mapas' => ['index.php', 'Mapas'], 'hosts' => ['admin.php', 'Hosts'], 'comunidades' => ['comunidades.php', 'Comunidades SNMP'],
-              'usuarios' => ['usuarios.php', 'Usuarios']]; ?>
+              'proxys' => ['proxys.php', 'Proxys'], 'usuarios' => ['usuarios.php', 'Usuarios']]; ?>
 <header class="barra">
   <a class="marca" href="index.php">
     <span class="logo"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M11 7.2L6.2 15.8M13 7.2l4.8 8.6M7.5 18h9"/></svg></span>

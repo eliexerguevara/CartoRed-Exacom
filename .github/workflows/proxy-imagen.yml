@@ -1,0 +1,38 @@
+# Imagen del proxy para MikroTik (paquete container) y Docker: un .tar por arquitectura, listo para subir al
+# MikroTik (Files) y usar con /container/add file=... Se descarga desde la pestaña Actions (Artifacts).
+name: Imagen del proxy
+
+on:
+  push:
+    branches: [main]
+    paths: ['proxy/**', 'bin/seccart2-anexar', '.github/workflows/proxy-imagen.yml']
+  workflow_dispatch:
+
+jobs:
+  imagen:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plataforma: linux/arm64      # RB5009, CCR2004, CCR2116, hAP ax2/ax3, L009…
+            nombre: arm64
+          - plataforma: linux/amd64      # CHR (x86) o Docker en un PC/servidor
+            nombre: amd64
+          - plataforma: linux/arm/v7     # ARM de 32 bits (hAP ac2, RB4011…); puede tardar más
+            nombre: arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir
+        run: |
+          docker buildx build --platform ${{ matrix.plataforma }} -f proxy/Dockerfile \
+            -t cartored-proxy:latest --output type=docker,dest=cartored-proxy-${{ matrix.nombre }}.tar .
+          ls -lh cartored-proxy-${{ matrix.nombre }}.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cartored-proxy-${{ matrix.nombre }}
+          path: cartored-proxy-${{ matrix.nombre }}.tar
+          retention-days: 30
+          compression-level: 0

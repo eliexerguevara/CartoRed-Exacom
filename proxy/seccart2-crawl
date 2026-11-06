@@ -1,0 +1,9 @@
+#!/opt/seccart2/bin/python
+# seccart2-discover del proxy: la clave del almacen la deja cartored-proxy en $SECCART2_HOME/vault.pass
+import getpass, os, sys
+from pathlib import Path
+_pw = (Path(os.environ.get("SECCART2_HOME", "/data/sc2")) / "vault.pass").read_text().strip()
+getpass.getpass = lambda prompt="": _pw
+from sc2.scng.discovery.cli import main
+sys.argv[0] = "seccart2-crawl"
+sys.exit(main())

@@ -8,12 +8,16 @@ La web (www-data) solo escribe:
 Este proceso valida todo (lo que escribe la web se trata como no confiable), agrega comunidades al
 almacen, recorre la red, anexa los equipos de acceso y publica. Deja el estado en estado/<mapa>.json.
 """
+import base64
 import fcntl
 import gzip
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -300,7 +304,8 @@ def correr(cmd, log, timeout=1800):
     return salida
 
 
-def actualizar(mapa, v):
+def plan_de(mapa, v):
+    """Lo que hace falta para recorrer un mapa (el servidor o un proxy): IPs, opciones y credenciales."""
     hosts, prof, auto, barrido, ocultar = leer_config(mapa)
     asegurar_en_vault(v, hosts)
     publicar_lista_comunidades(v)
@@ -309,51 +314,74 @@ def actualizar(mapa, v):
     comms = comunidades(v)
     if not comms:
         raise ValueError('No hay comunidades SNMP cargadas')
-    routers = [e['ip'] for e in nucleo if e['tipo'] == 'router']
-    switches = [e['ip'] for e in nucleo if e['tipo'] == 'switch']
+    # el recorrido de SecureCartography2 usa SNMP v2c en el puerto 161; el resto lo consulta seccart2-anexar
+    ips = list(dict.fromkeys(h['ip'] for h in nucleo + acceso
+                             if h['version'] == 'v2c' and h['puerto'] == 161 and not h['sin_escaneo']
+                             and h['tipo'] != 'olt'))   # la OLT no entra al recorrido completo: solo se leen sus uplinks
+    return {
+        'ips': ips, 'profundidad': prof, 'auto_vecinos': auto, 'barrido': barrido,
+        'acceso': [{'nombre': e['nombre'], 'ip': e['ip']} for e in acceso],
+        'routers': [e['ip'] for e in nucleo if e['tipo'] == 'router'],
+        'switches': [e['ip'] for e in nucleo if e['tipo'] == 'switch'],
+        # comunidades e interfaz SNMP de cada host (para seccart2-anexar)
+        'credenciales': {
+            'comunidades': [{'nombre': n, 'community': c} for n, c in comms],
+            'hosts': {h['ip']: {'version': h['version'], 'puerto': h['puerto'], 'community': h['community'],
+                                'tipo': h['tipo'], 'bloqueados': h['bloqueados'],
+                                'solo_manuales': h['solo_manuales'], 'sin_escaneo': h['sin_escaneo'],
+                                'bloqueo_ppp': h['bloqueo_ppp'], 'api_vlans': h['api_vlans']} for h in hosts},
+            'api': credencial_api() if any(h['api_vlans'] for h in hosts) else None,
+            'ocultar': ocultar,
+            'enlaces': leer_enlaces(),
+        },
+    }
+
+
+def ahora_txt():
+    return time.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def actualizar(mapa, v):
+    proxy = proxy_de(mapa)
+    try:
+        plan = plan_de(mapa, v)
+    except Exception as e:
+        guardar_estado(mapa, estado='error', inicio=ahora_txt(), fin=ahora_txt(), log=[], resumen=str(e), proxy=proxy)
+        return
+    if proxy:
+        pedir_a_proxy(mapa, proxy, plan)
+        return
     log = []
-    guardar_estado(mapa, estado='ejecutando', inicio=time.strftime('%Y-%m-%d %H:%M:%S'), fin='', log=[], resumen='')
-    destino, tmp = MAPAS_ROOT / mapa, MAPAS_ROOT / f'{mapa}.nuevo'
+    guardar_estado(mapa, estado='ejecutando', inicio=ahora_txt(), fin='', log=[], resumen='', proxy='')
+    tmp = MAPAS_ROOT / f'{mapa}.nuevo'
     subprocess.run(['rm', '-rf', str(tmp)])
     try:
-        # el recorrido de SecureCartography2 usa SNMP v2c en el puerto 161; el resto lo consulta seccart2-anexar
-        ips = list(dict.fromkeys(h['ip'] for h in nucleo + acceso
-                                 if h['version'] == 'v2c' and h['puerto'] == 161 and not h['sin_escaneo']
-                                 and h['tipo'] != 'olt'))   # la OLT no entra al recorrido completo: solo se leen sus uplinks
-        salida = correr(['/usr/local/bin/seccart2-crawl', 'crawl', *ips, '-d', str(prof), '--no-dns', '-t', '10',
-                         '--no-color', '-o', str(tmp)], log)
+        salida = correr(['/usr/local/bin/seccart2-crawl', 'crawl', *plan['ips'], '-d', str(plan['profundidad']), '--no-dns',
+                         '-t', '10', '--no-color', '-o', str(tmp)], log)
         ok = sum(1 for l in salida if l.strip().startswith('OK:'))
         if not (tmp / 'map.json').exists():
             raise RuntimeError('El recorrido no generó map.json')
         (tmp / 'map.crawl.json').write_bytes((tmp / 'map.json').read_bytes())
-        if nucleo:   # siempre: aplica tipos, puertos bloqueados, ocultos y (si hay routers) ARP
+        n_auto, bloq = '0', ''
+        if plan['routers'] or plan['switches']:   # siempre: aplica tipos, puertos bloqueados, ocultos y (si hay routers) ARP
             lista = tmp / 'acceso.csv'
-            lista.write_text(''.join(f"{e['nombre']}\t{e['ip']}\n" for e in acceso), encoding='utf-8')
-            # comunidades e interfaz SNMP de cada host: en archivo de root, no en la linea de comandos
+            lista.write_text(''.join(f"{e['nombre']}\t{e['ip']}\n" for e in plan['acceso']), encoding='utf-8')
+            # credenciales en archivo de root, no en la linea de comandos
             creds = tmp / 'credenciales.json'
             creds.touch(mode=0o600)
-            creds.write_text(json.dumps({
-                'comunidades': [{'nombre': n, 'community': c} for n, c in comms],
-                'hosts': {h['ip']: {'version': h['version'], 'puerto': h['puerto'], 'community': h['community'],
-                                    'tipo': h['tipo'], 'bloqueados': h['bloqueados'],
-                                    'solo_manuales': h['solo_manuales'], 'sin_escaneo': h['sin_escaneo'],
-                                    'bloqueo_ppp': h['bloqueo_ppp'], 'api_vlans': h['api_vlans']} for h in hosts},
-                'api': credencial_api(v) if any(h['api_vlans'] for h in hosts) else None,
-                'ocultar': ocultar,
-                'enlaces': leer_enlaces(),
-            }), encoding='utf-8')
+            creds.write_text(json.dumps(plan['credenciales']), encoding='utf-8')
             cmd = ['/usr/local/bin/seccart2-anexar', str(tmp / 'map.crawl.json'), str(lista), '-o', str(tmp / 'map.json'),
                    '--credenciales', str(creds), '--puertos-salida', str(tmp / 'puertos.json'),
-                   # VLANs vistas en cada puerto en los ultimos 7 dias (la primera vez se arma desde el historial)
+                   # VLANs vistas en cada puerto en las ultimas horas (la primera vez se arma desde el historial)
                    '--memoria-vlan', str(BASE / 'vlanmem' / f'{mapa}.json'), '--historial', str(HISTORIAL / mapa),
                    '--cache-olt', str(BASE / 'olt')]
-            for r in routers:
+            for r in plan['routers']:
                 cmd += ['--router', r]
-            for s in switches:
+            for s in plan['switches']:
                 cmd += ['--switch', s]
-            if auto:
+            if plan['auto_vecinos']:
                 cmd.append('--auto-vecinos')
-            if barrido:
+            if plan['barrido']:
                 cmd.append('--barrido')
             try:
                 salida_anexar = correr(cmd, log)
@@ -364,33 +392,254 @@ def actualizar(mapa, v):
             bloq = next(('; ' + l for l in salida_anexar if l.startswith('Puertos bloqueados')), '')
             bloq += next(('; ' + l for l in salida_anexar if l.startswith('Enlaces manuales')), '')
             bloq += next(('; ' + l for l in salida_anexar if l.startswith('Equipos por PPP/VPN ocultos')), '')
-        else:
-            n_auto, bloq = '0', ''
-        if destino.exists():
-            subprocess.run(['rm', '-rf', str(MAPAS_ROOT / f'{mapa}.anterior')])
-            destino.rename(MAPAS_ROOT / f'{mapa}.anterior')
-        tmp.rename(destino)
-        correr(['/usr/local/bin/seccart2-publicar', str(destino), mapa], log)
-        try:
-            guardar_historial(mapa)
-        except Exception as e:
-            log.append(f'No se pudo guardar el historial: {e}')
-        # lista de puertos de routers/switches para la solapa Puertos de la pagina Hosts (solo lectura para la web)
-        if (destino / 'puertos.json').exists():
-            dir_p = BASE / 'puertos'
-            dir_p.mkdir(exist_ok=True)
-            shutil.chown(dir_p, 'root', 'www-data')
-            os.chmod(dir_p, 0o750)
-            tmp_p = dir_p / f'{mapa}.tmp'
-            tmp_p.write_bytes((destino / 'puertos.json').read_bytes())
-            shutil.chown(tmp_p, 'root', 'www-data')
-            os.chmod(tmp_p, 0o640)
-            tmp_p.replace(dir_p / f'{mapa}.json')
-        guardar_estado(mapa, estado='ok', fin=time.strftime('%Y-%m-%d %H:%M:%S'), log=log[-60:],
-                       resumen=f'{ok} equipos respondieron SNMP en el recorrido; {len(acceso)} equipos de acceso '
-                               f'anexados; {n_auto} vecinos agregados automáticamente{bloq}')
+        instalar(mapa, tmp, log, f"{ok} equipos respondieron SNMP en el recorrido; {len(plan['acceso'])} equipos de acceso "
+                                 f"anexados; {n_auto} vecinos agregados automáticamente{bloq}")
     except Exception as e:
-        guardar_estado(mapa, estado='error', fin=time.strftime('%Y-%m-%d %H:%M:%S'), log=log[-60:], resumen=str(e))
+        guardar_estado(mapa, estado='error', fin=ahora_txt(), log=log[-60:], resumen=str(e))
+
+
+def instalar(mapa, tmp, log, resumen):
+    """Recorrido terminado (aqui o en un proxy): lo deja en /root/mapas/<mapa>, publica, historial y puertos."""
+    destino = MAPAS_ROOT / mapa
+    if destino.exists():
+        subprocess.run(['rm', '-rf', str(MAPAS_ROOT / f'{mapa}.anterior')])
+        destino.rename(MAPAS_ROOT / f'{mapa}.anterior')
+    tmp.rename(destino)
+    correr(['/usr/local/bin/seccart2-publicar', str(destino), mapa], log)
+    try:
+        guardar_historial(mapa)
+    except Exception as e:
+        log.append(f'No se pudo guardar el historial: {e}')
+    # lista de puertos de routers/switches para la solapa Puertos de la pagina Hosts (solo lectura para la web)
+    if (destino / 'puertos.json').exists():
+        dir_p = BASE / 'puertos'
+        dir_p.mkdir(exist_ok=True)
+        shutil.chown(dir_p, 'root', 'www-data')
+        os.chmod(dir_p, 0o750)
+        tmp_p = dir_p / f'{mapa}.tmp'
+        tmp_p.write_bytes((destino / 'puertos.json').read_bytes())
+        shutil.chown(tmp_p, 'root', 'www-data')
+        os.chmod(tmp_p, 0o640)
+        tmp_p.replace(dir_p / f'{mapa}.json')
+    guardar_estado(mapa, estado='ok', fin=ahora_txt(), log=log[-60:], resumen=resumen)
+
+
+# ---------- Proxys (como el proxy activo de Zabbix) ----------
+# La web guarda en proxys.json el nombre y la clave de firma de cada proxy (no el token). El token queda solo
+# para root en /root/seccart-proxy/<proxy>/token. Cada pedido para un proxy va a pedidos.json (root) y,
+# cifrado con el token, a proxy/<proxy>/trabajo.bin, que proxy.php le entrega al proxy cuando consulta.
+# El proxy recorre su red y devuelve el resultado cifrado; proxy.php lo deja en proxy/<proxy>/entrada y encola
+# "proxy_resultado". Aqui se descifra, se valida y se publica como un recorrido local.
+PROXYS = BASE / 'inventario' / 'proxys.json'
+PROXY_WEB = BASE / 'proxy'
+PROXY_PRIV = Path('/root/seccart-proxy')
+PROXY_PLAZO = 1800          # sin resultado en 30 minutos: el pedido vence
+RE_TOKEN = re.compile(r'^[A-Za-z0-9_-]{40,64}$')
+
+
+def proxy_de(mapa):
+    try:
+        p = json.loads((MAPAS / f'{mapa}.json').read_text(encoding='utf-8')).get('proxy') or ''
+    except Exception:
+        return ''
+    return p if NOMBRE_MAPA.match(str(p)) else ''
+
+
+def proxys_web():
+    try:
+        d = json.loads(PROXYS.read_text(encoding='utf-8')).get('proxys', [])
+    except Exception:
+        return {}
+    return {p['nombre']: p for p in d if isinstance(p, dict) and NOMBRE_MAPA.match(str(p.get('nombre', '')))}
+
+
+def token_proxy(nombre):
+    try:
+        tk = (PROXY_PRIV / nombre / 'token').read_text().strip()
+    except OSError:
+        return None
+    return tk if RE_TOKEN.match(tk) else None
+
+
+def _clave(token):
+    return hmac.new(token.encode(), b'cartored-cifrado', hashlib.sha256).digest()
+
+
+def cifrar_proxy(token, nombre, para, datos):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    return b'CR1' + nonce + AESGCM(_clave(token)).encrypt(nonce, gzip.compress(datos), f'{nombre}|{para}'.encode())
+
+
+def descifrar_proxy(token, nombre, para, blob):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    if blob[:3] != b'CR1':
+        raise ValueError('formato desconocido')
+    return gzip.decompress(AESGCM(_clave(token)).decrypt(blob[3:15], blob[15:], f'{nombre}|{para}'.encode()))
+
+
+def carpetas_proxy(nombre):
+    web = PROXY_WEB / nombre
+    for d, modo in ((PROXY_WEB, 0o750), (web, 0o2770), (web / 'entrada', 0o2770)):
+        d.mkdir(exist_ok=True)
+        shutil.chown(d, 'root', 'www-data')
+        os.chmod(d, modo)
+    priv = PROXY_PRIV / nombre
+    priv.mkdir(parents=True, exist_ok=True)
+    os.chmod(PROXY_PRIV, 0o700)
+    os.chmod(priv, 0o700)
+    return web, priv
+
+
+def leer_pedidos(nombre):
+    try:
+        d = json.loads((PROXY_PRIV / nombre / 'pedidos.json').read_text(encoding='utf-8'))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def escribir_pedidos(nombre, pedidos):
+    web, priv = carpetas_proxy(nombre)
+    f = priv / 'pedidos.json'
+    tmp = f.with_suffix('.tmp')
+    tmp.touch(mode=0o600)
+    tmp.write_text(json.dumps(pedidos), encoding='utf-8')
+    tmp.replace(f)
+    token, trabajo = token_proxy(nombre), web / 'trabajo.bin'
+    if not token or not pedidos:
+        trabajo.unlink(missing_ok=True)
+        return
+    blob = cifrar_proxy(token, nombre, 'trabajo',
+                        json.dumps({'generado': int(time.time()), 'pedidos': list(pedidos.values())}).encode())
+    tmp = web / 'trabajo.tmp'
+    tmp.write_bytes(blob)
+    para_web_lectura(tmp, 0o640)
+    tmp.replace(trabajo)
+
+
+def ultimo_contacto(nombre):
+    try:
+        u = json.loads((PROXY_WEB / nombre / 'contacto.json').read_text(encoding='utf-8')).get('ultimo')
+        return time.strftime('%Y-%m-%d %H:%M', time.localtime(int(u)))
+    except Exception:
+        return 'nunca'
+
+
+def pedir_a_proxy(mapa, proxy, plan):
+    if proxy not in proxys_web() or not token_proxy(proxy):
+        guardar_estado(mapa, estado='error', inicio=ahora_txt(), fin=ahora_txt(), log=[], proxy=proxy,
+                       resumen=f'El proxy "{proxy}" no existe: elige otro en Hosts > Opciones del mapa')
+        return
+    pedidos = leer_pedidos(proxy)
+    pid = secrets.token_hex(8)
+    pedidos[mapa] = {'id': pid, 'mapa': mapa, 'creado': int(time.time()), 'plan': plan}
+    escribir_pedidos(proxy, pedidos)
+    guardar_estado(mapa, estado='ejecutando', inicio=ahora_txt(), fin='', proxy=proxy,
+                   log=[f'Pedido {pid} para el proxy {proxy} (último contacto: {ultimo_contacto(proxy)})'],
+                   resumen=f'Esperando al proxy "{proxy}"')
+
+
+def vencer_pedidos():
+    """Pedidos sin respuesta en PROXY_PLAZO: el mapa queda en error (la actualizacion automatica lo vuelve a pedir)."""
+    if not PROXY_PRIV.is_dir():
+        return
+    ahora = time.time()
+    for d in PROXY_PRIV.iterdir():
+        if not (d.is_dir() and NOMBRE_MAPA.match(d.name)):
+            continue
+        pedidos = leer_pedidos(d.name)
+        vencidos = [m for m, p in pedidos.items() if ahora - (p.get('creado') or 0) > PROXY_PLAZO]
+        for m in vencidos:
+            del pedidos[m]
+            if NOMBRE_MAPA.match(m) and (MAPAS / f'{m}.json').exists():
+                guardar_estado(m, estado='error', fin=ahora_txt(),
+                               resumen=f'El proxy "{d.name}" no entregó el resultado en {PROXY_PLAZO // 60} minutos '
+                                       f'(último contacto: {ultimo_contacto(d.name)})')
+        if vencidos:
+            escribir_pedidos(d.name, pedidos)
+
+
+def guardar_token_proxy(sol):
+    nombre, token = str(sol.get('nombre', '')), str(sol.get('token', ''))
+    if not NOMBRE_MAPA.match(nombre) or not RE_TOKEN.match(token):
+        return
+    _, priv = carpetas_proxy(nombre)
+    f = priv / 'token'
+    tmp = f.with_suffix('.tmp')
+    tmp.touch(mode=0o600)
+    tmp.write_text(token)
+    tmp.replace(f)
+    escribir_pedidos(nombre, leer_pedidos(nombre))   # lo pendiente se vuelve a cifrar con el token nuevo
+
+
+def quitar_proxy(sol):
+    nombre = str(sol.get('nombre', ''))
+    if not NOMBRE_MAPA.match(nombre) or nombre in proxys_web():
+        return
+    for m in leer_pedidos(nombre):
+        if NOMBRE_MAPA.match(m) and (MAPAS / f'{m}.json').exists():
+            guardar_estado(m, estado='error', fin=ahora_txt(), resumen=f'El proxy "{nombre}" se eliminó')
+    shutil.rmtree(PROXY_PRIV / nombre, ignore_errors=True)
+    shutil.rmtree(PROXY_WEB / nombre, ignore_errors=True)
+
+
+ARCHIVOS_PROXY = ('map.json', 'map.crawl.json', 'puertos.json', 'discovery_summary.json')
+
+
+def recibir_resultado(sol):
+    nombre, archivo = str(sol.get('proxy', '')), str(sol.get('archivo', ''))
+    if not NOMBRE_MAPA.match(nombre) or not re.fullmatch(r'[0-9a-f]{8,40}\.bin', archivo):
+        return
+    f = PROXY_WEB / nombre / 'entrada' / archivo
+    try:
+        blob = f.read_bytes()
+    except OSError:
+        return
+    finally:
+        f.unlink(missing_ok=True)
+    token = token_proxy(nombre)
+    try:
+        res = json.loads(descifrar_proxy(token, nombre, 'resultado', blob)) if token else None
+    except Exception:
+        res = None
+    if not isinstance(res, dict):
+        print(f'Resultado del proxy {nombre} no valido (token distinto?)', file=sys.stderr)
+        return
+    mapa = str(res.get('mapa', ''))
+    pedidos = leer_pedidos(nombre)
+    p = pedidos.get(mapa)
+    # solo el ultimo pedido de ese mapa, y si el mapa sigue asignado a este proxy
+    if not NOMBRE_MAPA.match(mapa) or not p or p.get('id') != res.get('id') or proxy_de(mapa) != nombre:
+        return
+    del pedidos[mapa]
+    escribir_pedidos(nombre, pedidos)
+    log = [f'Recorrido hecho por el proxy {nombre} ({str(res.get("inicio", ""))[:19]} a {str(res.get("fin", ""))[:19]})']
+    log += [str(l)[:500] for l in (res.get('log') or [])[-60:] if isinstance(l, str)]
+    if not res.get('ok'):
+        guardar_estado(mapa, estado='error', fin=ahora_txt(), log=log[-60:],
+                       resumen=f'Proxy {nombre}: ' + str(res.get('error', 'error desconocido'))[:500])
+        return
+    tmp = MAPAS_ROOT / f'{mapa}.nuevo'
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    try:
+        archivos = res.get('archivos') or {}
+        for n in ARCHIVOS_PROXY:
+            if n in archivos:
+                datos = base64.b64decode(archivos[n], validate=True)
+                d = json.loads(datos)
+                if not isinstance(d, (dict, list)):
+                    raise ValueError(f'{n} no es un objeto JSON')
+                (tmp / n).write_bytes(datos)
+        m = json.loads((tmp / 'map.json').read_text(encoding='utf-8'))
+        if not isinstance(m, dict) or not m or not all(isinstance(x, dict) for x in m.values()):
+            raise ValueError('map.json sin equipos o con un formato distinto')
+        resumen = re.sub(r'[\x00-\x1f<>]', '', str(res.get('resumen', '')))[:500]
+        instalar(mapa, tmp, log, f'{resumen} (vía proxy {nombre})')
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        guardar_estado(mapa, estado='error', fin=ahora_txt(), log=log[-60:], resumen=f'Resultado del proxy {nombre} no válido: {e}')
 
 
 def eliminar_mapa(mapa):
@@ -405,41 +654,59 @@ def eliminar_mapa(mapa):
     shutil.rmtree(HISTORIAL / mapa, ignore_errors=True)
 
 
-def credencial_api(v):
-    """{usuario, password} del usuario API de RouterOS guardado en el almacen, o None."""
+API_ARCHIVO = Path('/root/.seccart2/routeros-api.json')
+
+
+def credencial_api():
+    """{usuario, password} del usuario API de RouterOS (solo lectura), o None."""
+    try:
+        c = json.loads(API_ARCHIVO.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    if not isinstance(c, dict) or not c.get('usuario') or not c.get('password'):
+        return None
+    return {'usuario': c['usuario'], 'password': c['password']}
+
+
+def migrar_api(v):
+    """Versiones anteriores lo guardaban en el almacen como credencial SSH: se pasa al archivo y se borra de ahi."""
     try:
         c = v.get_ssh_credential(name=API_CRED)
     except Exception:
-        return None
-    if not c or not getattr(c, 'username', '') or not getattr(c, 'password', ''):
-        return None
-    return {'usuario': c.username, 'password': c.password}
+        c = None
+    if c is None:
+        return
+    if getattr(c, 'username', '') and getattr(c, 'password', '') and not API_ARCHIVO.exists():
+        escribir_api({'usuario': c.username, 'password': c.password})
+    try:
+        v.remove_credential(name=API_CRED)
+    except Exception:
+        pass
 
 
-def publicar_estado_api(v):
+def escribir_api(d):
+    API_ARCHIVO.parent.mkdir(mode=0o700, exist_ok=True)
+    tmp = API_ARCHIVO.with_suffix('.tmp')
+    tmp.touch(mode=0o600)
+    tmp.write_text(json.dumps(d), encoding='utf-8')
+    tmp.replace(API_ARCHIVO)
+
+
+def publicar_estado_api():
     """La web solo ve si hay usuario API y su nombre, nunca la contrasena."""
-    c = credencial_api(v)
+    c = credencial_api()
     (BASE / 'api.json').write_text(json.dumps({'configurado': bool(c), 'usuario': c['usuario'] if c else ''}))
     os.chmod(BASE / 'api.json', 0o644)
 
 
-def guardar_api(sol, v):
+def guardar_api(sol):
     usuario, clave = str(sol.get('usuario', '')), str(sol.get('password', ''))
-    if not API_USUARIO.match(usuario) or not API_CLAVE.match(clave):
-        return
-    try:
-        v.remove_credential(name=API_CRED)
-    except Exception:
-        pass
-    v.add_ssh_credential(name=API_CRED, username=usuario, password=clave, port=8728,
-                         description='Usuario API RouterOS de solo lectura (VLANs del bridge), desde la web')
+    if API_USUARIO.match(usuario) and API_CLAVE.match(clave):
+        escribir_api({'usuario': usuario, 'password': clave})
 
 
-def quitar_api(v):
-    try:
-        v.remove_credential(name=API_CRED)
-    except Exception:
-        pass
+def quitar_api():
+    API_ARCHIVO.unlink(missing_ok=True)
 
 
 def agregar_comunidad(sol, v):
@@ -468,8 +735,13 @@ def main():
             migrar_inventario()
         except Exception as e:
             print(f'No se pudo crear la lista unica de hosts: {e}', file=sys.stderr)
+        try:
+            migrar_api(v)
+        except Exception as e:
+            print(f'No se pudo mover el usuario API fuera del almacen: {e}', file=sys.stderr)
         publicar_lista_comunidades(v)
-        publicar_estado_api(v)
+        publicar_estado_api()
+        vencer_pedidos()
         while True:
             pendientes = sorted(COLA.glob('*.json'), key=lambda p: p.stat().st_mtime)
             if not pendientes:
@@ -485,16 +757,26 @@ def main():
                     agregar_comunidad(sol, v)
                     publicar_lista_comunidades(v)
                 elif accion == 'api_usuario':
-                    guardar_api(sol, v)
-                    publicar_estado_api(v)
+                    guardar_api(sol)
+                    publicar_estado_api()
                 elif accion == 'api_quitar':
-                    quitar_api(v)
-                    publicar_estado_api(v)
+                    quitar_api()
+                    publicar_estado_api()
+                elif accion == 'proxy_token':
+                    guardar_token_proxy(sol)
+                elif accion == 'proxy_quitar':
+                    quitar_proxy(sol)
+                elif accion == 'proxy_resultado':
+                    try:
+                        recibir_resultado(sol)
+                    except Exception as e:
+                        print(f'Resultado de proxy: {e}', file=sys.stderr)
                 elif accion == 'eliminar' and NOMBRE_MAPA.match(str(sol.get('mapa', ''))):
                     eliminar_mapa(sol['mapa'])
                 elif accion == 'actualizar' and NOMBRE_MAPA.match(str(sol.get('mapa', ''))):
                     if (MAPAS / f"{sol['mapa']}.json").exists():
                         actualizar(sol['mapa'], v)
+            vencer_pedidos()
 
 
 if __name__ == '__main__':

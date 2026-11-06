@@ -444,8 +444,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cfg['auto_vecinos'] = !empty($_POST['auto_vecinos']);
             $cfg['barrido'] = !empty($_POST['barrido']);
             $cfg['ocultar_ppp'] = !empty($_POST['ocultar_ppp']);
+            // quien recorre el mapa: este servidor ('') o un proxy de la pagina Proxys
+            $px = (string)($_POST['proxy'] ?? '');
+            $proxys = array_column(leer_json(BASE . '/inventario/proxys.json', ['proxys' => []])['proxys'] ?? [], 'nombre');
+            if ($px === '' || in_array($px, $proxys, true)) $cfg['proxy'] = $px;
+            if (($cfg['proxy'] ?? '') === '') unset($cfg['proxy']);
             guardar_cfg($m, $cfg);
-            $_SESSION['flash'] = 'Opciones del mapa guardadas.';
+            $_SESSION['flash'] = 'Opciones del mapa guardadas.' . (!empty($cfg['proxy']) ? " Lo recorre el proxy \"{$cfg['proxy']}\"." : '');
         }
         header($volver); exit;
 
@@ -540,7 +545,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!preg_match('/^[A-Za-z0-9._@-]{1,40}$/', $u) || !preg_match('/^[\x20-\x7e]{1,128}$/', $p))
             $_SESSION['flash_err'] = 'Usuario (letras, números, . _ @ -) o contraseña inválidos.';
         else { encolar(['accion' => 'api_usuario', 'usuario' => $u, 'password' => $p]);
-               $_SESSION['flash'] = "Usuario API \"$u\" enviado. Se guarda cifrado en unos segundos."; }
+               $_SESSION['flash'] = "Usuario API \"$u\" enviado. Queda guardado en unos segundos."; }
         header('Location: comunidades.php'); exit;
 
     } elseif ($accion === 'api_quitar') {
@@ -849,6 +854,15 @@ $J = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPE
       <div class="cuerpo" style="display:flex;flex-direction:column;gap:18px">
         <input type="hidden" name="csrf" value="<?= h($csrf) ?>"><input type="hidden" name="mapa" value="<?= h($mapa) ?>">
         <input type="hidden" name="accion" value="opciones">
+        <?php $lista_px = array_column(leer_json(BASE . '/inventario/proxys.json', ['proxys' => []])['proxys'] ?? [], 'nombre'); sort($lista_px);
+              $px_act = (string)($cfg['proxy'] ?? ''); ?>
+        <label class="campo" style="max-width:420px">Quién recorre este mapa
+          <select name="proxy">
+            <option value="">Este servidor</option>
+            <?php foreach ($lista_px as $px): ?><option value="<?= h($px) ?>" <?= $px === $px_act ? 'selected' : '' ?>>Proxy: <?= h($px) ?></option><?php endforeach; ?>
+            <?php if ($px_act !== '' && !in_array($px_act, $lista_px, true)): ?><option value="" selected>Proxy eliminado (<?= h($px_act) ?>): elige otro</option><?php endif; ?>
+          </select>
+          <span class="sub" style="font-size:13px">Para redes que el servidor no alcanza: el proxy recorre la red desde adentro. Se crean en <a href="proxys.php">Proxys</a>.</span></label>
         <fieldset style="margin:0;padding:0;border:0;display:flex;flex-direction:column;gap:10px;max-width:640px">
           <legend style="font-size:14px;font-weight:500;margin-bottom:10px">Profundidad del recorrido LLDP / CDP</legend>
           <div class="seg">

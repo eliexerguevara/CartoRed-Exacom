@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Proxy de CartoRed (como un proxy activo de Zabbix): corre dentro de la red remota, por ejemplo en un
+contenedor de un MikroTik.
+
+Cada CARTORED_INTERVALO segundos le pregunta al servidor si hay mapas para actualizar. Si hay, recorre su
+red local con SecureCartography2 + seccart2-anexar (igual que el servidor) y le entrega el resultado.
+El servidor publica el mapa, guarda el historial y la lista de puertos.
+
+Variables de entorno:
+  CARTORED_SERVIDOR   URL de la web del mapa, p. ej. http://10.253.252.47/mapa
+  CARTORED_PROXY      nombre del proxy (el mismo que en la pagina Proxys)
+  CARTORED_TOKEN      token que mostro la pagina Proxys al crearlo
+  CARTORED_INTERVALO  segundos entre consultas (por defecto 30)
+  CARTORED_DATOS      carpeta persistente (por defecto /data)
+
+Seguridad: cada pedido va firmado (HMAC-SHA256) y todo lo que viaja (comunidades, resultados) va cifrado
+con AES-256-GCM, con claves derivadas del token. Sirve aunque el servidor use HTTP.
+"""
+import base64
+import gzip
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+VERSION = "1.0"
+SERVIDOR = os.environ.get("CARTORED_SERVIDOR", "").rstrip("/")
+NOMBRE = os.environ.get("CARTORED_PROXY", "")
+TOKEN = os.environ.get("CARTORED_TOKEN", "")
+INTERVALO = max(10, int(os.environ.get("CARTORED_INTERVALO", "30") or 30))
+DATOS = Path(os.environ.get("CARTORED_DATOS", "/data"))
+SC2 = DATOS / "sc2"                        # almacen de SecureCartography2 (SECCART2_HOME)
+HECHOS = DATOS / "hechos.json"             # pedidos ya entregados (no se repiten)
+NOMBRE_MAPA = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+MAX_RESULTADO = 7 * 1024 * 1024            # el servidor acepta hasta 8 MB por envio
+
+K_AUTH = hmac.new(TOKEN.encode(), b"cartored-auth", hashlib.sha256).hexdigest()
+K_CIFRADO = hmac.new(TOKEN.encode(), b"cartored-cifrado", hashlib.sha256).digest()
+parar = False
+
+
+def log(*a):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+
+def cifrar(datos: bytes, para: str) -> bytes:
+    nonce = secrets.token_bytes(12)
+    return b"CR1" + nonce + AESGCM(K_CIFRADO).encrypt(nonce, gzip.compress(datos), f"{NOMBRE}|{para}".encode())
+
+
+def descifrar(blob: bytes, para: str) -> bytes:
+    if blob[:3] != b"CR1":
+        raise ValueError("formato desconocido")
+    return gzip.decompress(AESGCM(K_CIFRADO).decrypt(blob[3:15], blob[15:], f"{NOMBRE}|{para}".encode()))
+
+
+def pedir(accion: str, cuerpo: bytes, timeout=60):
+    """POST firmado a proxy.php. Devuelve (codigo HTTP, cuerpo)."""
+    ts = str(int(time.time()))
+    msg = f"{NOMBRE}\n{ts}\n{accion}\n{hashlib.sha256(cuerpo).hexdigest()}"
+    firma = hmac.new(K_AUTH.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(f"{SERVIDOR}/proxy.php?accion={accion}", data=cuerpo, method="POST", headers={
+        "X-Proxy": NOMBRE, "X-Tiempo": ts, "X-Firma": firma,
+        "Content-Type": "application/octet-stream", "User-Agent": f"cartored-proxy/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def leer_hechos():
+    try:
+        return json.loads(HECHOS.read_text())
+    except Exception:
+        return []
+
+
+def guardar_hechos(h):
+    HECHOS.write_text(json.dumps(h[-100:]))
+
+
+def correr(cmd, registro, timeout=1800, env=None):
+    registro.append("$ " + " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(DATOS), env=env)
+    salida = (r.stdout + r.stderr).strip().splitlines()
+    registro.extend(l for l in salida if "Warning" not in l)
+    if r.returncode != 0:
+        raise RuntimeError(f"{Path(cmd[0]).name} terminó con código {r.returncode}")
+    return salida
+
+
+def preparar_almacen(comunidades):
+    """Almacen de SecureCartography2 nuevo en cada pedido, solo con las comunidades que mando el servidor."""
+    from sc2.scng.creds.vault import CredentialVault
+    SC2.mkdir(parents=True, exist_ok=True)
+    os.chmod(SC2, 0o700)
+    clave = secrets.token_urlsafe(24)
+    for f in SC2.glob("credentials.db*"):
+        f.unlink()
+    v = CredentialVault(SC2 / "credentials.db")
+    v.initialize(clave)
+    for i, c in enumerate(comunidades):
+        v.add_snmpv2c_credential(name=c["nombre"], community=c["community"], priority=100 + i)
+    pw = SC2 / "vault.pass"
+    pw.touch(mode=0o600)
+    pw.write_text(clave)
+
+
+def recorrer(p, registro):
+    """Mismo proceso que seccart-web-run en el servidor. Devuelve (archivos, resumen)."""
+    mapa, plan = p["mapa"], p["plan"]
+    tmp = DATOS / "mapas" / f"{mapa}.nuevo"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    cred = plan["credenciales"]
+    preparar_almacen(cred.get("comunidades", []))
+    env = dict(os.environ, SECCART2_HOME=str(SC2))
+    salida = correr(["seccart2-crawl", "crawl", *plan["ips"], "-d", str(plan["profundidad"]), "--no-dns", "-t", "10",
+                     "--no-color", "-o", str(tmp)], registro, env=env)
+    ok = sum(1 for l in salida if l.strip().startswith("OK:"))
+    if not (tmp / "map.json").exists():
+        raise RuntimeError("El recorrido no generó map.json")
+    (tmp / "map.crawl.json").write_bytes((tmp / "map.json").read_bytes())
+    acceso = plan.get("acceso", [])
+    n_auto, extra = "0", ""
+    if plan.get("routers") or plan.get("switches"):
+        lista = tmp / "acceso.csv"
+        lista.write_text("".join(f"{e['nombre']}\t{e['ip']}\n" for e in acceso), encoding="utf-8")
+        creds = tmp / "credenciales.json"
+        creds.touch(mode=0o600)
+        creds.write_text(json.dumps(cred), encoding="utf-8")
+        for d in ("vlanmem", "olt"):
+            (DATOS / d).mkdir(exist_ok=True)
+        cmd = ["seccart2-anexar", str(tmp / "map.crawl.json"), str(lista), "-o", str(tmp / "map.json"),
+               "--credenciales", str(creds), "--puertos-salida", str(tmp / "puertos.json"),
+               "--memoria-vlan", str(DATOS / "vlanmem" / f"{mapa}.json"), "--cache-olt", str(DATOS / "olt")]
+        for r in plan.get("routers", []):
+            cmd += ["--router", r]
+        for s in plan.get("switches", []):
+            cmd += ["--switch", s]
+        if plan.get("auto_vecinos"):
+            cmd.append("--auto-vecinos")
+        if plan.get("barrido"):
+            cmd.append("--barrido")
+        try:
+            sal = correr(cmd, registro)
+        finally:
+            creds.unlink(missing_ok=True)
+        n_auto = next((re.search(r"\((\d+)\)", l).group(1) for l in sal if l.startswith("Agregados automaticamente")), "0")
+        for pre in ("Puertos bloqueados", "Enlaces manuales", "Equipos por PPP/VPN ocultos"):
+            extra += next(("; " + l for l in sal if l.startswith(pre)), "")
+    for f in SC2.glob("credentials.db*"):
+        f.unlink()
+    archivos = {}
+    for n in ("map.json", "map.crawl.json", "puertos.json", "discovery_summary.json"):
+        if (tmp / n).exists():
+            archivos[n] = base64.b64encode((tmp / n).read_bytes()).decode()
+    resumen = (f"{ok} equipos respondieron SNMP en el recorrido; {len(acceso)} equipos de acceso anexados; "
+               f"{n_auto} vecinos agregados automáticamente{extra}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return archivos, resumen
+
+
+def atender(p):
+    inicio = time.strftime("%Y-%m-%d %H:%M:%S")
+    log(f"mapa {p['mapa']}: recorriendo (pedido {p['id']})")
+    res = {"id": p["id"], "mapa": p["mapa"], "inicio": inicio}
+    registro = []
+    try:
+        archivos, resumen = recorrer(p, registro)
+        res.update(ok=True, archivos=archivos, resumen=resumen)
+        log(f"mapa {p['mapa']}: {resumen}")
+    except Exception as e:
+        res.update(ok=False, error=str(e)[:500])
+        log(f"mapa {p['mapa']}: error: {e}")
+    res["log"] = registro[-60:]
+    res["fin"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    blob = cifrar(json.dumps(res).encode(), "resultado")
+    if len(blob) > MAX_RESULTADO:   # mapa demasiado grande: se avisa en vez de mandarlo
+        res = {k: v for k, v in res.items() if k != "archivos"}
+        res.update(ok=False, error=f"El resultado ocupa {len(blob) // 1048576} MB comprimido (máximo 7 MB)")
+        blob = cifrar(json.dumps(res).encode(), "resultado")
+    for intento in range(5):
+        try:
+            cod, cuerpo = pedir("resultado", blob, timeout=120)
+            if cod == 200:
+                return True
+            log(f"el servidor rechazó el resultado ({cod}): {cuerpo[:200]!r}")
+            return cod < 500   # 4xx: no tiene sentido reintentar
+        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            log(f"no se pudo entregar el resultado ({e}); reintento")
+            time.sleep(10 * (intento + 1))
+    return False
+
+
+def ciclo():
+    hechos = leer_hechos()
+    estado = json.dumps({"version": VERSION, "equipo": socket.gethostname()}).encode()
+    cod, cuerpo = pedir("trabajo", estado)
+    if cod == 204:
+        return
+    if cod != 200:
+        log(f"el servidor respondió {cod}: {cuerpo[:200]!r}")
+        return
+    trabajo = json.loads(descifrar(cuerpo, "trabajo"))
+    for p in trabajo.get("pedidos", []):
+        if parar:
+            return
+        if not (isinstance(p, dict) and NOMBRE_MAPA.match(str(p.get("mapa", ""))) and p.get("id")) or p["id"] in hechos:
+            continue
+        if atender(p):
+            hechos.append(p["id"])
+            guardar_hechos(hechos)
+
+
+def main():
+    global parar
+    falta = [n for n, v in (("CARTORED_SERVIDOR", SERVIDOR), ("CARTORED_PROXY", NOMBRE), ("CARTORED_TOKEN", TOKEN)) if not v]
+    if falta:
+        log("faltan las variables " + ", ".join(falta))
+        return 2
+    if not NOMBRE_MAPA.match(NOMBRE):
+        log("CARTORED_PROXY solo admite letras, números, - y _")
+        return 2
+
+    def salir(*_):
+        global parar
+        parar = True
+    signal.signal(signal.SIGTERM, salir)
+    signal.signal(signal.SIGINT, salir)
+    DATOS.mkdir(parents=True, exist_ok=True)
+    log(f"cartored-proxy {VERSION}: proxy \"{NOMBRE}\", servidor {SERVIDOR}, cada {INTERVALO} s")
+    avisado = False
+    while not parar:
+        try:
+            ciclo()
+            if avisado:
+                log("conexión con el servidor recuperada")
+            avisado = False
+        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            if not avisado:
+                log(f"sin conexión con el servidor: {e}")
+            avisado = True
+        except Exception as e:   # p. ej. token equivocado: el trabajo no se puede descifrar
+            log(f"error: {e.__class__.__name__}: {e}")
+        for _ in range(INTERVALO):
+            if parar:
+                break
+            time.sleep(1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

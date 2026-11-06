@@ -31,9 +31,15 @@ Está construido sobre [Secure Cartography 2](https://github.com/scottpeterman/s
 - **Visor**: menú **Tipos** (ocultar routers, switches, antenas, OLT…), menú **Datos** (IP, RSTP, marca),
   fondo blanco, mapa de calles/satelital de fondo, orden guardado, etiquetas de VLAN ordenadas en bloque,
   exportar PNG.
+- **Proxys** (como los proxys activos de Zabbix): para redes que el servidor no alcanza. Un contenedor dentro
+  de esa red (por ejemplo en un MikroTik) le pregunta al servidor cada 30 s si hay mapas para recorrer, los
+  recorre con el mismo motor y le entrega el resultado. Pedidos firmados (HMAC) y datos cifrados (AES-GCM)
+  con un token por proxy, aunque el servidor use HTTP. Se crean en la página **Proxys** y cada mapa elige
+  quién lo recorre en **Hosts → Opciones**.
 - **Acceso**: usuarios propios con contraseña (bcrypt), bloqueo tras 5 intentos, sesión de 8 horas.
-  Las comunidades SNMP y el usuario API se guardan cifrados en el almacén de SecureCartography2: la web
-  nunca ve sus valores.
+  Las comunidades SNMP se guardan cifradas en el almacén de SecureCartography2 y el usuario API en un archivo
+  que solo lee root (fuera del almacén, para que el recorrido no lo pruebe como login SSH): la web nunca ve
+  sus valores.
 
 ## Cómo funciona
 
@@ -63,6 +69,7 @@ La web (usuario `www-data`) solo escribe configuración y pedidos; todo lo que c
 | `sbin/` | `/usr/local/sbin/` | `seccart-web-run`, `seccart-web-auto`, `seccart-oui-update` |
 | `systemd/` | `/etc/systemd/system/` | Cola (`.path` + `.service`), actualización automática y lista OUI mensual |
 | `apache/` | `/etc/apache2/conf-available/` | `seccart-mapa.conf` |
+| `proxy/` | contenedor en la red remota | Proxy: `Dockerfile`, agente `cartored-proxy` y `seccart2-crawl` del proxy |
 
 No se incluyen datos de la red: mapas publicados, hosts, comunidades, usuarios, historial ni el almacén.
 
@@ -117,6 +124,26 @@ En los MikroTik, crear un usuario del grupo `read` (el mismo en todos) con el se
 `api-ssl` (8729). Cargarlo en **Comunidades SNMP → Usuario API RouterOS** y activar
 **Leer VLANs del bridge por API** en cada router/switch en **Hosts**. Si la API no responde, ese equipo
 sigue con SNMP.
+
+## Opcional: proxys para redes remotas
+
+```
+proxy (red remota) ── POST proxy.php?accion=trabajo  (cada 30 s, firmado) ──> servidor
+                   <── trabajo.bin: mapas a recorrer + comunidades (cifrado con el token)
+   recorre su red (seccart2-crawl + seccart2-anexar)
+                   ── POST proxy.php?accion=resultado (cifrado) ──> cola ──> seccart-web-run publica
+```
+
+1. Imagen: la arma el workflow **Imagen del proxy** (pestaña Actions de GitHub) en `.tar` para `arm64`,
+   `amd64` y `arm`. También se puede construir a mano: `docker build -f proxy/Dockerfile -t cartored-proxy .`
+2. En la web, **Proxys → Crear proxy**: muestra el token una sola vez y los comandos de RouterOS.
+3. En el MikroTik (RouterOS 7 con el paquete `container`): modo contenedor, `veth`, variables
+   `CARTORED_SERVIDOR`, `CARTORED_PROXY`, `CARTORED_TOKEN` y una carpeta montada en `/data` (los pasos están
+   en la página Proxys). En Docker: `docker run -d --network host -v cartored:/data -e CARTORED_...=... cartored-proxy`.
+4. En **Hosts → Opciones del mapa**, elegir el proxy en **Quién recorre este mapa**.
+
+Si el proxy no entrega el resultado en 30 minutos, el mapa queda con error y la actualización automática lo
+vuelve a pedir. La web solo guarda la clave de firma; el token queda en `/root/seccart-proxy/<proxy>/token`.
 
 ## Licencia
 
