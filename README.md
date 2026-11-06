@@ -73,7 +73,19 @@ La web (usuario `www-data`) solo escribe configuración y pedidos; todo lo que c
 
 No se incluyen datos de la red: mapas publicados, hosts, comunidades, usuarios, historial ni el almacén.
 
-## Instalación (Ubuntu 24.04)
+## Instalación automática (Ubuntu 22.04 / 24.04, Debian 12 / 13)
+
+```bash
+bash instalador/generar.sh          # arma cartored-instalar.sh con el programa del último commit
+sudo bash cartored-instalar.sh      # en el servidor: solo pide el usuario y la contraseña de la web
+```
+
+`cartored-instalar.sh` es un solo archivo, con el programa adentro, que se copia al servidor. Instala paquetes,
+SecureCartography2 (sin la interfaz gráfica), crea el almacén cifrado, la web, los servicios y el primer
+usuario. Volver a ejecutarlo actualiza el programa y conserva los datos. Sin preguntas:
+`sudo CARTORED_USUARIO=admin CARTORED_CLAVE='...' bash cartored-instalar.sh`.
+
+## Instalación manual (Ubuntu 24.04)
 
 1. Paquetes:
    ```bash
