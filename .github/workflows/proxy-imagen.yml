@@ -19,20 +19,27 @@ jobs:
             nombre: arm64
           - plataforma: linux/amd64      # CHR (x86) o Docker en un PC/servidor
             nombre: amd64
-          - plataforma: linux/arm/v7     # ARM de 32 bits (hAP ac2, RB4011…); puede tardar más
+          - plataforma: linux/arm/v7     # ARM de 32 bits (hAP ac2, RB4011…)
             nombre: arm
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Construir
+        # capas sin comprimir: el formato de "docker save" clasico, el que RouterOS importa sin problemas
         run: |
-          docker buildx build --platform ${{ matrix.plataforma }} -f proxy/Dockerfile \
-            -t cartored-proxy:latest --output type=docker,dest=cartored-proxy-${{ matrix.nombre }}.tar .
+          docker buildx build --platform ${{ matrix.plataforma }} -f proxy/Dockerfile -t cartored-proxy:latest \
+            --output type=docker,compression=uncompressed,force-compression=true,dest=cartored-proxy-${{ matrix.nombre }}.tar .
           ls -lh cartored-proxy-${{ matrix.nombre }}.tar
+      - name: Revisar
+        # la imagen arranca en su arquitectura (por emulacion) y carga todo lo que usa el proxy
+        run: |
+          docker load -i cartored-proxy-${{ matrix.nombre }}.tar
+          docker run --rm --platform ${{ matrix.plataforma }} --entrypoint /opt/seccart2/bin/python cartored-proxy:latest -c \
+            "import platform, sc2.scng.discovery.cli, sc2.scng.creds.vault; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('ok', platform.machine())"
+          docker run --rm --platform ${{ matrix.plataforma }} --entrypoint sh cartored-proxy:latest -c "command -v snmpbulkwalk fping"
       - uses: actions/upload-artifact@v4
         with:
           name: cartored-proxy-${{ matrix.nombre }}
           path: cartored-proxy-${{ matrix.nombre }}.tar
           retention-days: 30
-          compression-level: 0
