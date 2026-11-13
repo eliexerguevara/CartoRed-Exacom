@@ -781,6 +781,29 @@ def main():
                                                       if not es_generico(v["sysname"]) else "")
             v["fuente"] = fuente_por_mac.get(v["mac_r"], "IP neighbor") if v["ip_r"] else ""
 
+    # tercera pasada: un router anuncia una IP y una MAC por cada interfaz (fisica, VLAN, EoIP...). Si varios
+    # vecinos tienen el mismo nombre (no generico) y la misma descripcion, y sus MAC fisicas son del mismo equipo,
+    # son un solo equipo: todos usan la IP mas confiable y el resto queda como "otras IPs".
+    def mac_fisica(m):   # MAC universal (no virtual): bit "localmente administrada" en 0
+        n = mac_int(m) if m else None
+        return n if n and not (n >> 40) & 0x02 else None   # 00:00:00:00:00:00 no cuenta
+    rango_fuente = {"LLDP": 0, "ARP": 1, "IP neighbor": 2}
+    por_nombre = {}
+    for v in no_listados:
+        if v["ip_r"] and not es_generico(v["sysname"]):
+            por_nombre.setdefault(v["sysname"].strip(), []).append(v)
+    for sysn, vs in por_nombre.items():
+        if len({v["ip_r"] for v in vs}) < 2:
+            continue
+        descs = {re.sub(r"\s+", " ", v["sysdesc"]).strip() for v in vs if v["sysdesc"].strip()}
+        fisicas = sorted({f for f in (mac_fisica(v["mac_r"]) for v in vs) if f is not None})
+        if len(descs) > 1 or (fisicas and fisicas[-1] - fisicas[0] > 256):
+            continue   # mismo nombre pero otro modelo, o MAC de equipos distintos: no se juntan
+        mejor = min(vs, key=lambda v: (rango_fuente.get(v["fuente"], 3), mac_fisica(v["mac_r"]) is None, v["ip_r"]))
+        otras = sorted({v["ip_r"] for v in vs} - {mejor["ip_r"]}, key=lambda x: ipaddress.ip_address(x))
+        for v in vs:
+            v["ip_r"], v["mac_r"], v["fuente"], v["otras_ips"] = mejor["ip_r"], mejor["mac_r"], mejor["fuente"], otras
+
     # equipo del mapa que ya tiene cada IP, con su MAC (para detectar IP duplicadas)
     dueno_ip = {}
     for n, d in mapa.items():
@@ -803,7 +826,8 @@ def main():
         clave = (mac or ip) if conflicto else (ip or mac or f"{v['sysname']}|{v['equipo']}|{v['puerto']}")
         g = grupos.setdefault(clave, {"ip": ip, "mac": mac or (ip_mac.get(ip, "") if ip else ""),
                                       "sysname": v["sysname"], "sysdesc": v["sysdesc"], "enlaces": [],
-                                      "fuente": v["fuente"], "conflicto": conflicto})
+                                      "fuente": v["fuente"], "conflicto": conflicto, "otras_ips": []})
+        g["otras_ips"] = sorted(set(g["otras_ips"]) | set(v.get("otras_ips", [])))
         g["sysdesc"] = g["sysdesc"] or v["sysdesc"]
         g["sysname"] = g["sysname"] if not es_generico(g["sysname"]) else (v["sysname"] or g["sysname"])
         g["enlaces"].append((v["equipo"], v["puerto"], v["remoto"] or "uplink"))
@@ -846,6 +870,8 @@ def main():
             meta["snmp_pendiente"] = True     # se sondea despues, en paralelo
         if g["conflicto"]:
             meta["ip_duplicada"] = f"{g['ip']} también la tiene {g['conflicto']}"
+        if g["otras_ips"]:
+            meta["otras_ips"] = ", ".join(g["otras_ips"])
         mapa[nombre] = {"node_details": {"ip": g["ip"], "platform": platform, "model": platform, "metadata": meta},
                         "peers": {}}
         # preferir puertos fisicos; las interfaces vlan/bridge solo si no hay otra
