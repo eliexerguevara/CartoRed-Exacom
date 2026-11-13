@@ -70,8 +70,19 @@ La web (usuario `www-data`) solo escribe configuración y pedidos; todo lo que c
 | `systemd/` | `/etc/systemd/system/` | Cola (`.path` + `.service`), actualización automática y lista OUI mensual |
 | `apache/` | `/etc/apache2/conf-available/` | `seccart-mapa.conf` |
 | `proxy/` | contenedor en la red remota | Proxy: `Dockerfile`, agente `cartored-proxy` y `seccart2-crawl` del proxy |
+| `servidor/` | contenedor del servidor | `Dockerfile`, `entrypoint` (Apache + worker + timers) y configuración de Apache para contenedor |
 
 No se incluyen datos de la red: mapas publicados, hosts, comunidades, usuarios, historial ni el almacén.
+
+## Instalación en un contenedor (MikroTik CHR / RouterOS 7, o Docker)
+
+El servidor completo también se puede correr como **un solo contenedor** (`servidor/`), con los datos en un
+volumen `/data`. Guía paso a paso para el CHR: [instalacion-CartoRed-Servidor-CHR.md](instalacion-CartoRed-Servidor-CHR.md).
+
+```bash
+docker build -f servidor/Dockerfile -t cartored-server .
+docker run -d -p 80:80 -v cartored-datos:/data -e CARTORED_USUARIO=admin -e CARTORED_CLAVE='...' cartored-server
+```
 
 ## Instalación automática (Ubuntu 22.04 / 24.04, Debian 12 / 13)
 

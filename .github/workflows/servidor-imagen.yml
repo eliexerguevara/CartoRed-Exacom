@@ -1,0 +1,87 @@
+# Imagen del servidor completo para MikroTik (paquete container, CHR incluido) y Docker.
+# - Se publica en GitHub Container Registry: ghcr.io/<usuario>/cartored-server:latest
+#   (en RouterOS:  remote-image=ghcr.io/<usuario>/cartored-server:latest). El paquete tiene que ser publico
+#   (GitHub > Packages > cartored-server > Package settings > Change visibility), porque RouterOS baja sin usuario.
+# - Ademas deja un .tar para amd64 (CHR / x86) en Artifacts, por si se prefiere subirlo a Files y usar file=...
+name: Imagen del servidor
+
+on:
+  push:
+    branches: [main]
+    paths: ['servidor/**', 'bin/**', 'sbin/**', 'web/**', 'apache/**', '.github/workflows/servidor-imagen.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  probar-y-publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construir (amd64) para probar
+        run: |
+          docker buildx build --platform linux/amd64 -f servidor/Dockerfile -t cartored-server:prueba --load .
+
+      - name: Probar el contenedor
+        # arranca de verdad: crea el almacen y el usuario, levanta Apache, y comprueba la web y los permisos
+        run: |
+          docker volume create cartored-prueba >/dev/null
+          docker run -d --name cartored --platform linux/amd64 -p 8080:80 -v cartored-prueba:/data \
+            -e CARTORED_USUARIO=prueba -e CARTORED_CLAVE=clave-de-prueba-123 -e TZ=America/Argentina/Buenos_Aires \
+            cartored-server:prueba
+          for i in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/mapa/login.php && break
+            sleep 2
+          done
+          docker logs cartored
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mapa/login.php)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mapa/lib.php)" = 403
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mapa/data/)" = 403
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = 302
+          # el almacen y el usuario quedaron en /data, y el worker ya publico la lista de comunidades
+          docker exec cartored sh -c 'test -s /data/root/.seccart2/vault.pass && test -s /data/seccart-web/cuentas/usuarios.json'
+          for i in $(seq 1 60); do docker exec cartored test -f /data/seccart-web/comunidades.json && break; sleep 2; done
+          docker exec cartored test -f /data/seccart-web/comunidades.json
+          # reiniciar no pide nada y conserva todo (el root-dir persiste entre arranques)
+          docker restart cartored >/dev/null
+          for i in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:8080/mapa/login.php && break; sleep 2; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mapa/login.php)" = 200
+          docker rm -f cartored >/dev/null
+
+      - name: Probar que sin usuario no arranca
+        run: |
+          # con timeout: si por error arrancara, el paso falla en vez de colgarse
+          salida=$(timeout 120 docker run --rm --platform linux/amd64 -v cartored-vacio:/data cartored-server:prueba 2>&1) && codigo=0 || codigo=$?
+          echo "$salida"
+          test "$codigo" = 1
+          echo "$salida" | grep -q "No hay usuarios en la web"
+
+      - name: .tar para amd64 (capas sin comprimir, el formato que RouterOS importa sin problemas)
+        run: |
+          docker buildx build --platform linux/amd64 -f servidor/Dockerfile -t cartored-server:latest \
+            --output type=docker,compression=uncompressed,force-compression=true,dest=cartored-server-amd64.tar .
+          ls -lh cartored-server-amd64.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cartored-server-amd64
+          path: cartored-server-amd64.tar
+          retention-days: 30
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publicar en ghcr.io (amd64 y arm64)
+        # sin "provenance"/"sbom": RouterOS entiende el manifiesto clasico, no los indices con atestaciones
+        run: |
+          IMG="ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/cartored-server"
+          docker buildx build --platform linux/amd64,linux/arm64 -f servidor/Dockerfile \
+            --provenance=false --sbom=false \
+            -t "$IMG:latest" -t "$IMG:${GITHUB_SHA::7}" --push .
+          echo "Publicada: $IMG:latest"

@@ -1,0 +1,187 @@
+#!/bin/bash
+# Arranque del servidor CartoRed-Exacom dentro de un contenedor. Hace lo que en el servidor normal hacen
+# el instalador y systemd:
+#   - prepara /data (todo lo que no se puede perder) y los enlaces a las rutas que usa el programa
+#   - crea el almacen cifrado de credenciales y el primer usuario de la web (solo la primera vez)
+#   - seccart-web.path     ->  bucle que procesa la cola (seccart-web-run)
+#   - seccart-web-auto.timer -> bucle que cada minuto encola los mapas que tocan (seccart-web-auto)
+#   - seccart-oui.timer    ->  bucle que baja la lista de fabricantes por MAC una vez al mes
+#   - Apache + PHP         ->  proceso principal; si se cae, el contenedor termina
+#
+# Variables (en RouterOS: una envlist del contenedor):
+#   CARTORED_USUARIO / CARTORED_CLAVE   usuario y contrasena de la web. Solo se usan para CREAR el usuario;
+#                                       si ya existe no se toca (CARTORED_CLAVE_FORZAR=si para reemplazar la clave).
+#   TZ                                  zona horaria (por defecto UTC), p. ej. America/Argentina/Buenos_Aires
+#   CARTORED_SOLO_PROXY_PUBLICO=si      desde fuera de las redes privadas solo se puede usar proxy.php
+#   CARTORED_REDES_PRIVADAS="..."       redes permitidas en ese modo (por defecto las privadas habituales)
+set -uo pipefail
+
+DATOS=${CARTORED_DATOS:-/data}
+WEB=/var/www/html/mapa
+BASE=/var/lib/seccart-web
+export HOME=/root LC_ALL=C.UTF-8
+
+log() { printf '[cartored] %s\n' "$*"; }
+falla() { printf '[cartored][error] %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || falla "Tiene que correr como root."
+[ -d "$DATOS" ] || falla "No existe $DATOS. En RouterOS agrega un mount hacia una carpeta del disco con destino $DATOS."
+
+# ---------------------------------------------------------------- zona horaria
+TZ=${TZ:-UTC}
+if [ -e "/usr/share/zoneinfo/$TZ" ]; then
+    ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+    echo "$TZ" > /etc/timezone
+else
+    log "Zona horaria '$TZ' desconocida: se usa UTC."
+    TZ=UTC
+fi
+export TZ
+for d in /etc/php/*/apache2/conf.d /etc/php/*/cli/conf.d; do
+    [ -d "$d" ] && printf 'date.timezone = %s\n' "$TZ" > "$d/99-cartored.ini"
+done
+
+# ---------------------------------------------------------------- datos persistentes
+# El programa usa rutas fijas (/var/lib/seccart-web, /root/.seccart2, ...): se enlazan hacia /data.
+mkdir -p "$DATOS/seccart-web" "$DATOS/seccart-oui" "$DATOS/publicados" \
+         "$DATOS/root/mapas" "$DATOS/root/seccart-proxy" "$DATOS/root/.seccart2"
+enlazar() {   # enlazar <ruta-del-programa> <destino-en-/data>
+    if [ -L "$1" ]; then
+        [ "$(readlink "$1")" = "$2" ] || ln -sfn "$2" "$1"
+    else
+        # si queda algo dentro (imagen vieja, primer arranque sin datos), se conserva en /data y no se pisa nada
+        if [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; then
+            cp -an "$1"/. "$2"/ 2>/dev/null || true
+        fi
+        rm -rf "$1"
+        mkdir -p "$(dirname "$1")"
+        ln -s "$2" "$1"
+    fi
+}
+enlazar "$BASE"                "$DATOS/seccart-web"
+enlazar /var/lib/seccart-oui   "$DATOS/seccart-oui"
+enlazar "$WEB/data"            "$DATOS/publicados"
+enlazar /root/mapas            "$DATOS/root/mapas"
+enlazar /root/seccart-proxy    "$DATOS/root/seccart-proxy"
+enlazar /root/.seccart2        "$DATOS/root/.seccart2"
+
+# Carpetas y permisos: los mismos que crea el instalador (la web es www-data; el worker, root)
+install -d -o root -g www-data -m 750 "$BASE" "$BASE"/historial "$BASE"/puertos "$BASE"/proxy
+for d in cola cuentas inventario mapas posiciones sesiones; do install -d -o root -g www-data -m 2770 "$BASE/$d"; done
+install -d -m 755 "$BASE"/estado "$BASE"/vlanmem "$BASE"/olt "$DATOS"/seccart-oui "$DATOS"/publicados
+install -d -m 700 "$DATOS"/root "$DATOS"/root/mapas "$DATOS"/root/seccart-proxy "$DATOS"/root/.seccart2
+# volumen nuevo o copiado desde otro servidor: la web tiene que poder leer/escribir lo suyo
+chown root:www-data "$BASE"/cuentas "$BASE"/cola "$BASE"/mapas "$BASE"/inventario "$BASE"/posiciones "$BASE"/sesiones 2>/dev/null || true
+
+# ---------------------------------------------------------------- almacen cifrado de credenciales
+if [ ! -s /root/.seccart2/vault.pass ]; then
+    if [ -n "$(find /root/.seccart2 -mindepth 1 -maxdepth 2 -type f ! -name vault.pass 2>/dev/null | head -1)" ]; then
+        # hay un almacen sin su clave: crear otra clave dejaria las comunidades SNMP ilegibles
+        falla "Hay datos en /root/.seccart2 pero falta vault.pass. Copia vault.pass del servidor anterior (tiene que ser el que abre ese almacen)."
+    fi
+    (umask 077; openssl rand -base64 30 | tr -d '\n' > /root/.seccart2/vault.pass)
+fi
+chmod 600 /root/.seccart2/vault.pass
+/opt/seccart2/bin/python - <<'PY' || falla "No se pudo abrir ni crear el almacen de credenciales."
+from pathlib import Path
+from sc2.scng.creds.vault import CredentialVault
+v = CredentialVault()
+pw = Path('/root/.seccart2/vault.pass').read_text().strip()
+if not v.is_initialized:
+    v.initialize(pw)
+    print('[cartored] almacen creado')
+elif not v.unlock(pw):
+    raise SystemExit('El almacen ya existe y /root/.seccart2/vault.pass no lo abre')
+else:
+    print('[cartored] almacen existente: se conserva')
+PY
+
+# ---------------------------------------------------------------- usuario de la web (solo la primera vez)
+hay_usuarios() {
+    php -r '$d = @json_decode((string)@file_get_contents("/var/lib/seccart-web/cuentas/usuarios.json"), true);
+            exit(is_array($d["usuarios"] ?? null) && $d["usuarios"] ? 0 : 1);'
+}
+crear_usuario() {
+    local u=${CARTORED_USUARIO:-} c=${CARTORED_CLAVE:-}
+    [[ $u =~ ^[A-Za-z0-9._-]{2,32}$ ]] || falla "CARTORED_USUARIO inválido: de 2 a 32 letras, números, punto, - o _."
+    [ ${#c} -ge 8 ] || falla "CARTORED_CLAVE debe tener al menos 8 caracteres."
+    CARTORED_USUARIO="$u" CARTORED_CLAVE="$c" php -r '
+        $f = "/var/lib/seccart-web/cuentas/usuarios.json";
+        $d = is_file($f) ? json_decode(file_get_contents($f), true) : [];
+        $u = is_array($d["usuarios"] ?? null) ? $d["usuarios"] : [];
+        $n = getenv("CARTORED_USUARIO");
+        $forzar = getenv("CARTORED_CLAVE_FORZAR") === "si";
+        if (isset($u[$n]) && !$forzar) { echo "[cartored] el usuario $n ya existe: no se toca\n"; exit(0); }
+        $nuevo = !isset($u[$n]);
+        $u[$n] = ["hash" => password_hash(getenv("CARTORED_CLAVE"), PASSWORD_DEFAULT),
+                  "creado" => $u[$n]["creado"] ?? date("Y-m-d H:i"), "cambio" => date("Y-m-d H:i")];
+        ksort($u);
+        file_put_contents($f, json_encode(["usuarios" => $u], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+        echo $nuevo ? "[cartored] usuario $n creado\n" : "[cartored] contraseña de $n actualizada\n";'
+    chown www-data:www-data "$BASE"/cuentas/usuarios.json
+    chmod 660 "$BASE"/cuentas/usuarios.json
+}
+if [ -n "${CARTORED_USUARIO:-}" ] && [ -n "${CARTORED_CLAVE:-}" ]; then
+    crear_usuario
+elif ! hay_usuarios; then
+    falla "No hay usuarios en la web. Define CARTORED_USUARIO y CARTORED_CLAVE (envlist del contenedor) para crear el primero."
+fi
+
+# ---------------------------------------------------------------- Apache
+mkdir -p /run/apache2 /var/lock/apache2 /var/log/apache2
+rm -f /run/apache2/apache2.pid /run/apache2/*.pid     # el root-dir persiste entre arranques: un pid viejo impediria arrancar
+chown www-data:www-data /run/apache2 /var/lock/apache2 2>/dev/null || true
+if [ "${CARTORED_SOLO_PROXY_PUBLICO:-}" = "si" ]; then
+    # Desde fuera de las redes privadas solo proxy.php (los proxys). Se carga despues de seccart-mapa.conf (orden alfabetico).
+    redes=${CARTORED_REDES_PRIVADAS:-127.0.0.1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10}
+    cat > /etc/apache2/conf-available/seccart-publico.conf <<CONF
+<Directory /var/www/html/mapa>
+    Require ip $redes
+</Directory>
+<Files "proxy.php">
+    Require all granted
+</Files>
+CONF
+    a2enconf -q seccart-publico
+    log "Modo restringido: fuera de $redes solo se entrega proxy.php"
+else
+    a2disconf -q seccart-publico 2>/dev/null || true
+fi
+apache2ctl configtest 2>&1 | grep -v "Syntax OK" | grep -v AH00558 || true
+
+# ---------------------------------------------------------------- lo que hacen systemd y los timers
+trabajador() {   # seccart-web.path + seccart-web.service: procesa la cola apenas aparece un pedido
+    /usr/local/sbin/seccart-web-run || log "seccart-web-run terminó con error (código $?)"   # arranque: migraciones y lista de comunidades
+    while :; do
+        if compgen -G "$BASE/cola/*.json" >/dev/null; then
+            /usr/local/sbin/seccart-web-run || log "seccart-web-run terminó con error (código $?)"
+            # si siguen quedando pedidos (error que se repite), no girar en vacio
+            compgen -G "$BASE/cola/*.json" >/dev/null && sleep 30
+        fi
+        sleep 2
+    done
+}
+automatico() {   # seccart-web-auto.timer: cada minuto en punto
+    while :; do
+        sleep $((60 - $(date +%-S)))
+        /usr/local/sbin/seccart-web-auto || log "seccart-web-auto terminó con error (código $?)"
+    done
+}
+fabricantes() {  # seccart-oui.timer: una vez al mes (reintenta cada hora si no hay salida a Internet)
+    local f=/var/lib/seccart-oui/manuf espera
+    sleep 60
+    while :; do
+        if [ -s "$f" ] && [ -n "$(find "$f" -mtime -30 2>/dev/null)" ]; then
+            espera=86400
+        elif /usr/local/sbin/seccart-oui-update; then
+            espera=86400
+        else
+            espera=3600
+        fi
+        sleep "$espera"
+    done
+}
+trabajador & automatico & fabricantes &
+
+log "Servidor listo en el puerto 80 (http://<ip-del-contenedor>/mapa), zona horaria $TZ"
+exec apache2ctl -D FOREGROUND
